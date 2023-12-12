@@ -21,7 +21,7 @@ app.post('/upload', upload.single('file'), (req, res) => {
   const file = req.file;
 
   const params = {
-    Bucket: 'nombre-de-tu-bucket',
+    Bucket: 'vigpr-sf-prod',
     Key: file.originalname,
     Body: file.buffer,
   };
@@ -35,7 +35,42 @@ app.post('/upload', upload.single('file'), (req, res) => {
   });
 });
 
-// Agrega más endpoints según tus necesidades (descargar, eliminar, etc.)
+// Endpoint para descargar archivos
+app.get('/download/:key', (req, res) => {
+  const key = req.params.key;
+
+  const params = {
+    Bucket: 'vigpr-sf-prod',
+    Key: key,
+  };
+
+  s3.getObject(params, (err, data) => {
+    if (err) {
+      return res.status(500).json({ error: err.message });
+    }
+
+    res.setHeader('Content-Disposition', `attachment; filename=${key}`);
+    res.send(data.Body);
+  });
+});
+
+// Endpoint para eliminar archivos
+app.delete('/delete/:key', (req, res) => {
+  const key = req.params.key;
+
+  const params = {
+    Bucket: 'vigpr-sf-prod',
+    Key: key,
+  };
+
+  s3.deleteObject(params, (err, data) => {
+    if (err) {
+      return res.status(500).json({ error: err.message });
+    }
+
+    res.json({ message: 'Archivo eliminado con éxito', data });
+  });
+});
 
 app.listen(port, () => {
   console.log(`Servidor en http://localhost:${port}`);
