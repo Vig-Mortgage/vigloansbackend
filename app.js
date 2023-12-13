@@ -1,77 +1,98 @@
 const express = require('express');
+const { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand } = require('@aws-sdk/client-s3');
 const multer = require('multer');
-const AWS = require('aws-sdk');
+const multerS3 = require('multer-s3');
+const morgan = require('morgan');
+const fs = require('fs');
+const path = require('path');
 
 const app = express();
 const port = 3000;
+require('dotenv').config();
 
-// Configura AWS
-AWS.config.update({
+
+// Configura AWS SDK v3
+const s3Client = new S3Client({
+  region: 'us-east-1',
+  credentials: {
+
   accessKeyId: process.env.AWS_ACCESS_KEY_ID,
   secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+  }
 });
 
-const s3 = new AWS.S3();
-
-// Configura Multer para manejar la carga de archivos
-const upload = multer({ dest: 'uploads/' });
-
-// Endpoint para subir archivos
-app.post('/upload', upload.single('file'), (req, res) => {
-  const file = req.file;
-
-  const params = {
-    Bucket: 'vigpr-sf-prod',
-    Key: file.originalname,
-    Body: file.buffer,
-  };
-
-  s3.upload(params, (err, data) => {
-    if (err) {
-      return res.status(500).json({ error: err.message });
+// Configura Multer para usar multer-s3
+const upload = multer({
+  storage: multerS3({
+    s3: s3Client,
+    bucket: 'vigpr-sf-prod',
+    key: function (req, file, cb) {
+      cb(null, file.originalname);
     }
-
-    res.json({ message: 'Archivo subido con éxito', data });
-  });
+  })
 });
 
-// Endpoint para descargar archivos
-app.get('/download/:key', (req, res) => {
+// Middleware de registro de solicitudes con Morgan
+const accessLogStream = fs.createWriteStream(path.join(__dirname, 'access.log'), { flags: 'a' });
+app.use(morgan('combined', { stream: accessLogStream }));
+
+// Endpoint para subir archivos a S3
+app.post('/uploadFile', upload.single('file'), async (req, res) => {
+  try {
+    if (!req.file) {
+      throw new Error('No se recibió ningún archivo');
+    }
+    console.log('Archivo subido:', req.file.originalname);
+    res.send("Archivo subido con éxito.");
+  } catch (err) {
+    console.error('Error en uploadFile:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+
+// Endpoint para descargar archivos de S3
+app.get('/downloadFile/:key', async (req, res) => {
   const key = req.params.key;
 
-  const params = {
+  const getParams = {
     Bucket: 'vigpr-sf-prod',
     Key: key,
   };
 
-  s3.getObject(params, (err, data) => {
-    if (err) {
-      return res.status(500).json({ error: err.message });
-    }
+  try {
+    const command = new GetObjectCommand(getParams);
+    const { Body } = await s3Client.send(command);
 
     res.setHeader('Content-Disposition', `attachment; filename=${key}`);
-    res.send(data.Body);
-  });
+    Body.pipe(res);
+  } catch (err) {
+    console.error('Error en downloadFile:', err.message);
+    res.status(500).json({ error: err.message });
+  }
 });
 
-// Endpoint para eliminar archivos
-app.delete('/delete/:key', (req, res) => {
+// Endpoint para eliminar archivos de S3
+app.delete('/deleteFile/:key', async (req, res) => {
   const key = req.params.key;
 
-  const params = {
+  const deleteParams = {
     Bucket: 'vigpr-sf-prod',
     Key: key,
   };
 
-  s3.deleteObject(params, (err, data) => {
-    if (err) {
-      return res.status(500).json({ error: err.message });
-    }
+  try {
+    const command = new DeleteObjectCommand(deleteParams);
+    await s3Client.send(command);
 
-    res.json({ message: 'Archivo eliminado con éxito', data });
-  });
+    console.log('Archivo eliminado:', key);
+    res.json({ message: 'Archivo eliminado con éxito' });
+  } catch (err) {
+    console.error('Error en deleteFile:', err.message);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 app.listen(port, () => {
-  console.log(`Servidor en http://localhost:${port}`);
+  console.log(`Servidor escuchando en el puerto:${port}`);
 });
