@@ -7,8 +7,30 @@ const fs = require('fs');
 const path = require('path');
 
 const app = express();
-const port = 3000;
+const port = 8080;
 require('dotenv').config();
+console.log(process.env);
+const jwt = require('jsonwebtoken');
+
+const SECRET_KEY = process.env.JWT_SECRET_KEY;
+
+function verificarJWT(req, res, next) {
+  const token = req.headers['authorization']?.split(' ')[1]; // Bearer <token>
+
+  if (!token) {
+    return res.status(403).send({ message: "Token no proporcionado." });
+  }
+
+  jwt.verify(token, SECRET_KEY, (err, decoded) => {
+    if (err) {
+      return res.status(401).send({ message: "Token inválido." });
+    }
+
+    req.usuario = decoded; // Guarda la información decodificada del token
+    next();
+  });
+}
+
 
 
 // Configura AWS SDK v3
@@ -26,6 +48,7 @@ const upload = multer({
   storage: multerS3({
     s3: s3Client,
     bucket: 'vigpr-sf-prod',
+    contentType: multerS3.AUTO_CONTENT_TYPE, // Autodetecta y establece el Content-Type
     key: function (req, file, cb) {
       cb(null, file.originalname);
     }
@@ -37,7 +60,7 @@ const accessLogStream = fs.createWriteStream(path.join(__dirname, 'access.log'),
 app.use(morgan('combined', { stream: accessLogStream }));
 
 // Endpoint para subir archivos a S3
-app.post('/uploadFile', upload.single('file'), async (req, res) => {
+app.post('/uploadFile', verificarJWT, upload.single('file'), async (req, res) => {
   try {
     if (!req.file) {
       throw new Error('No se recibió ningún archivo');
@@ -52,7 +75,7 @@ app.post('/uploadFile', upload.single('file'), async (req, res) => {
 
 
 // Endpoint para descargar archivos de S3
-app.get('/downloadFile/:key', async (req, res) => {
+app.get('/downloadFile/:key', verificarJWT, async (req, res) => {
   const key = req.params.key;
 
   const getParams = {
@@ -73,7 +96,7 @@ app.get('/downloadFile/:key', async (req, res) => {
 });
 
 // Endpoint para eliminar archivos de S3
-app.delete('/deleteFile/:key', async (req, res) => {
+app.delete('/deleteFile/:key', verificarJWT, async (req, res) => {
   const key = req.params.key;
 
   const deleteParams = {
@@ -96,3 +119,4 @@ app.delete('/deleteFile/:key', async (req, res) => {
 app.listen(port, () => {
   console.log(`Servidor escuchando en el puerto:${port}`);
 });
+
