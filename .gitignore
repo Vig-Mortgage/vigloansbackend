@@ -1,2 +1,7 @@
 node_modules/
 .env
+access.log
+access.log
+process.env.JWT_SECRET_KEY
+test-aws-credentials.js
+.env
