@@ -235,6 +235,7 @@ app.get('/config', verificarJWT, async (req, res) => {
 app.post('/sf/token', authLimiter, async (req, res) => {
   try {
     const { code, redirectUri } = req.body;
+    console.log(`[SF TOKEN EXCHANGE] Received redirectUri (Backend): ${redirectUri}`);
     if (!code || !redirectUri) {
       return res.status(400).json({ error: 'code y redirectUri son requeridos.' });
     }
