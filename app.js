@@ -4,6 +4,9 @@ const { SecretsManagerClient, GetSecretValueCommand } = require('@aws-sdk/client
 const multer = require('multer');
 const multerS3 = require('multer-s3');
 const morgan = require('morgan');
+const helmet = require('helmet');
+const cors = require('cors');
+const rateLimit = require('express-rate-limit');
 const fs = require('fs');
 const path = require('path');
 const jwt = require('jsonwebtoken');
@@ -11,13 +14,26 @@ const { PDFDocument } = require('pdf-lib');
 const PDFDocumentKit = require('pdfkit');
 const stream = require('stream');
 const { promisify } = require('util');
-const { exec } = require('child_process');
+const { execFile } = require('child_process');
 const os = require('os');
 require('dotenv').config();
 
 const app = express();
+app.set('trust proxy', 1); // Necesario para rate limiting correcto detrás de ELB/proxy
 const port = process.env.PORT || 8080;
 const gsExecutable = process.env.GS_EXECUTABLE || 'gs';
+
+// -------------------- SANITIZACIÓN DE NOMBRES DE ARCHIVO --------------------
+// Permite: alfanuméricos, underscores, guiones, puntos
+// Bloquea: path traversal (../), barras, caracteres especiales de shell
+function sanitizeFilename(filename) {
+  if (!filename || typeof filename !== 'string') return '';
+  // Eliminar cualquier intento de path traversal
+  const cleaned = filename.replace(/\.\./g, '').replace(/[\/\\]/g, '');
+  // Solo permitir caracteres seguros
+  const sanitized = cleaned.replace(/[^a-zA-Z0-9_.\-]/g, '');
+  return sanitized || '';
+}
 
 // -------------------- AWS SECRETS MANAGER --------------------
 const smClient = new SecretsManagerClient({
@@ -77,8 +93,14 @@ async function getAppConfig() {
   return getSecret('vigloans/app-config');
 }
 
-// -------------------- MIDDLEWARE PARA PARSEAR JSON --------------------
-app.use(express.json());
+// -------------------- MIDDLEWARE DE SEGURIDAD --------------------
+app.use(helmet());
+app.use(cors({
+  origin: process.env.CORS_ORIGIN || '*',
+  methods: ['GET', 'POST', 'DELETE'],
+  credentials: true,
+}));
+app.use(express.json({ limit: '10mb' }));
 
 // -------------------- HEALTH CHECK ENDPOINT --------------------
 app.get('/health', (req, res) => {
@@ -99,8 +121,17 @@ app.get('/', (req, res) => {
   res.status(404).json({ error: 'Not Found' });
 });
 
+// -------------------- RATE LIMITER PARA AUTENTICACIÓN --------------------
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutos
+  max: 10,                   // máximo 10 intentos por IP
+  message: { error: 'Demasiados intentos de autenticación. Intente de nuevo en 15 minutos.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
 // -------------------- ENDPOINT DE AUTENTICACIÓN --------------------
-app.post('/authenticate', async (req, res) => {
+app.post('/authenticate', authLimiter, async (req, res) => {
   try {
     const secrets = await getBackendSecrets();
     const { username, password } = req.body;
@@ -201,7 +232,11 @@ app.post('/uploadFile', verificarJWT, upload.single('file'), async (req, res) =>
 // -------------------- ENDPOINT PARA DESCARGAR ARCHIVOS DE S3 --------------------
 app.get('/downloadFile/:key', verificarJWT, async (req, res) => {
   try {
-    const key = req.params.key;
+    const key = sanitizeFilename(req.params.key);
+    if (!key) {
+      return res.status(400).json({ error: 'Nombre de archivo inválido.' });
+    }
+
     const getParams = {
       Bucket: uploadBucketName,
       Key: key,
@@ -209,24 +244,28 @@ app.get('/downloadFile/:key', verificarJWT, async (req, res) => {
 
     console.log('=== DOWNLOAD REQUEST ===');
     console.log('Key solicitada:', key);
-    console.log('Bucket:', getParams.Bucket);
     console.log('========================');
 
     const command = new GetObjectCommand(getParams);
     const { Body } = await s3Client.send(command);
-    res.setHeader('Content-Disposition', `attachment; filename=${key}`);
+    const safeName = key.replace(/["\r\n]/g, '_');
+    res.setHeader('Content-Disposition', `attachment; filename="${safeName}"`);
     Body.pipe(res);
     console.log('✅ Descarga exitosa:', key);
   } catch (err) {
     console.error('❌ Error en downloadFile:', err.message);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: 'Error al descargar el archivo.' });
   }
 });
 
 // -------------------- ENDPOINT PARA ELIMINAR ARCHIVOS DE S3 --------------------
 app.delete('/deleteFile/:key', verificarJWT, async (req, res) => {
   try {
-    const key = req.params.key;
+    const key = sanitizeFilename(req.params.key);
+    if (!key) {
+      return res.status(400).json({ error: 'Nombre de archivo inválido.' });
+    }
+
     const deleteParams = {
       Bucket: uploadBucketName,
       Key: key,
@@ -237,7 +276,7 @@ app.delete('/deleteFile/:key', verificarJWT, async (req, res) => {
     res.json({ message: 'Archivo eliminado con éxito' });
   } catch (err) {
     console.error('Error en deleteFile:', err.message);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: 'Error al eliminar el archivo.' });
   }
 });
 
@@ -444,17 +483,26 @@ async function mergePDFBuffers(pdfBuffers) {
 async function optimizePDF(inputBuffer) {
   console.log('Iniciando optimización del PDF...');
   const tempDir = os.tmpdir();
-  const tempInput = `${tempDir}/temp_${Date.now()}.pdf`;
-  const tempOutput = `${tempDir}/optimized_${Date.now()}.pdf`;
+  const tempInput = path.join(tempDir, `temp_${Date.now()}.pdf`);
+  const tempOutput = path.join(tempDir, `optimized_${Date.now()}.pdf`);
   try {
     fs.writeFileSync(tempInput, inputBuffer);
     console.log(`PDF temporal escrito en ${tempInput}`);
 
-    const gsCommand = `"${gsExecutable}" -sDEVICE=pdfwrite -dCompatibilityLevel=1.4 -dPDFSETTINGS=/ebook -dNOPAUSE -dQUIET -dBATCH -sOutputFile=${tempOutput} ${tempInput}`;
-    console.log(`Ejecutando comando Ghostscript: ${gsCommand}`);
+    const gsArgs = [
+      '-sDEVICE=pdfwrite',
+      '-dCompatibilityLevel=1.4',
+      '-dPDFSETTINGS=/ebook',
+      '-dNOPAUSE',
+      '-dQUIET',
+      '-dBATCH',
+      `-sOutputFile=${tempOutput}`,
+      tempInput,
+    ];
+    console.log(`Ejecutando Ghostscript: ${gsExecutable} ${gsArgs.join(' ')}`);
 
     await new Promise((resolve, reject) => {
-      exec(gsCommand, (error, stdout, stderr) => {
+      execFile(gsExecutable, gsArgs, (error, stdout, stderr) => {
         if (error) {
           console.error('Error al ejecutar Ghostscript:', error.message);
           return reject(error);
@@ -501,7 +549,7 @@ app.post('/mergePDFs', verificarJWT, async (req, res) => {
       return res.status(400).json({ error: 'No hay URLs válidas para procesar.' });
     }
 
-    const bucketName = await getBucketName();
+    const bucketName = uploadBucketName;
     const pdfBuffers = [];
     console.log(`Recibidas ${urls.length} URLs para procesar.`);
 
@@ -560,7 +608,7 @@ app.post('/mergePDFs', verificarJWT, async (req, res) => {
     console.log('--- Fin del endpoint /mergePDFs ---');
   } catch (err) {
     console.error('Error en mergePDFs:', err.message);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: 'Error al procesar el merge de archivos.' });
   }
 });
 
