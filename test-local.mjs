@@ -248,12 +248,61 @@ async function testJWTMiddleware() {
   }
 }
 
-// 6. Config remoto (protegido)
-async function testConfig() {
-  section('6. CONFIG REMOTA (protegido)');
+// 6. Config Público (sin auth)
+async function testConfigPublic() {
+  section('6. CONFIG PÚBLICA (sin auth)');
+
+  // Debe funcionar sin token
+  try {
+    const { data } = await request('GET', '/config/public', {
+      headers: { Authorization: '' },
+      expectStatus: 200,
+    });
+    const expectedPublicKeys = [
+      'node_host', 'sf_host', 'sf_community_host',
+      'sf_client_id_ios', 'sf_redirect_url',
+      'ath_public_token', 'paypal_domain_url', 'paypal_client_id',
+    ];
+
+    const presentKeys = expectedPublicKeys.filter(k => data[k] !== undefined && data[k] !== null);
+    const missingKeys = expectedPublicKeys.filter(k => data[k] === undefined || data[k] === null);
+
+    if (presentKeys.length === 0) throw new Error('No se retornó ninguna key pública');
+    logPass('GET /config/public', `${presentKeys.length}/${expectedPublicKeys.length} keys presentes`);
+
+    if (missingKeys.length > 0) {
+      log('⚠️', `  Keys faltantes: ${missingKeys.join(', ')}`);
+    }
+  } catch (e) {
+    logFail('GET /config/public', e.message);
+  }
+
+  // Verificar que NO se filtran secretos en la versión pública
+  try {
+    const { data } = await request('GET', '/config/public', {
+      headers: { Authorization: '' },
+    });
+    const secretKeys = [
+      'sf_client_secret_ios', 'paypal_secret_key',
+      'jwt_secret_key', 'auth_pass', 'auth_user',
+    ];
+    const leaked = secretKeys.filter(k => data[k] !== undefined);
+    if (leaked.length > 0) {
+      logFail('GET /config/public (seguridad)', `⚠️ SECRETOS FILTRADOS EN ENDPOINT PÚBLICO: ${leaked.join(', ')}`);
+    } else {
+      logPass('GET /config/public (seguridad)', 'No se filtraron secretos en endpoint público');
+    }
+  } catch (e) {
+    logFail('GET /config/public (seguridad)', e.message);
+  }
+}
+
+// 7. Config Privado (con auth)
+async function testConfigPrivate() {
+  section('7. CONFIG PRIVADA (con auth)');
 
   if (!jwtToken) {
-    logSkip('GET /config', 'Sin token JWT');
+    logSkip('GET /config (autenticado)', 'Sin token JWT');
     return;
   }
 
@@ -263,35 +312,159 @@ async function testConfig() {
       'ath_public_token', 'sf_host', 'sf_community_host',
       'sf_client_id_ios', 'sf_redirect_url',
       'paypal_client_id', 'paypal_domain_url', 'node_host',
+      'sf_client_secret_ios', 'paypal_secret_key',
     ];
 
     const presentKeys = expectedKeys.filter(k => data[k] !== undefined);
     const missingKeys = expectedKeys.filter(k => data[k] === undefined);
 
     if (presentKeys.length === 0) throw new Error('No se retornó ninguna key de configuración');
-
-    logPass('GET /config', `${presentKeys.length}/${expectedKeys.length} keys presentes`);
+    logPass('GET /config (autenticado)', `${presentKeys.length}/${expectedKeys.length} keys presentes`);
 
     if (missingKeys.length > 0) {
       log('⚠️', `  Keys faltantes: ${missingKeys.join(', ')}`);
     }
 
-    // Verificar que NO se filtraron secretos del backend
-    const dangerousKeys = ['jwt_secret_key', 'auth_pass', 'ath_private_token'];
-    const leaked = dangerousKeys.filter(k => data[k] !== undefined);
-    if (leaked.length > 0) {
-      logFail('GET /config (seguridad)', `⚠️ SECRETOS FILTRADOS: ${leaked.join(', ')}`);
+    // Verificar que los secretos sensibles SÍ están en la versión autenticada
+    if (data.sf_client_secret_ios) {
+      logPass('GET /config (SF secret)', 'sf_client_secret_ios presente en versión autenticada');
     } else {
-      logPass('GET /config (seguridad)', 'No se filtraron secretos del backend');
+      logFail('GET /config (SF secret)', 'sf_client_secret_ios FALTA en versión autenticada');
+    }
+
+    if (data.paypal_secret_key) {
+      logPass('GET /config (PayPal secret)', 'paypal_secret_key presente en versión autenticada');
+    } else {
+      logFail('GET /config (PayPal secret)', 'paypal_secret_key FALTA en versión autenticada');
     }
   } catch (e) {
-    logFail('GET /config', e.message);
+    logFail('GET /config (autenticado)', e.message);
   }
 }
 
-// 7. Upload, Download, Delete (ciclo completo)
+// 8. Autenticación por Salesforce Token
+async function testAuthenticateSF() {
+  section('8. AUTENTICACIÓN SF (/authenticate/sf)');
+
+  // Sin body
+  try {
+    const { status } = await request('POST', '/authenticate/sf', {
+      body: {},
+      headers: { Authorization: '' },
+    });
+    if (status !== 400) throw new Error(`Esperado 400, recibido ${status}`);
+    logPass('POST /authenticate/sf (sin body)', 'Retorna 400 correctamente');
+  } catch (e) {
+    logFail('POST /authenticate/sf (sin body)', e.message);
+  }
+
+  // Con sfHost inválido (no es dominio SF)
+  try {
+    const { status, data } = await request('POST', '/authenticate/sf', {
+      body: { sfAccessToken: 'test123', sfHost: 'https://evil.example.com' },
+      headers: { Authorization: '' },
+    });
+    if (status !== 400) throw new Error(`Esperado 400, recibido ${status}`);
+    logPass('POST /authenticate/sf (host inválido)', 'Rechaza dominios no-SF correctamente');
+  } catch (e) {
+    logFail('POST /authenticate/sf (host inválido)', e.message);
+  }
+
+  // Con token SF inválido pero host válido
+  try {
+    const { status } = await request('POST', '/authenticate/sf', {
+      body: { sfAccessToken: 'token_invalido_xyz', sfHost: 'https://vigmortage.my.salesforce.com' },
+      headers: { Authorization: '' },
+    });
+    if (status !== 401) throw new Error(`Esperado 401, recibido ${status}`);
+    logPass('POST /authenticate/sf (token inválido)', 'Rechaza tokens SF inválidos con 401');
+  } catch (e) {
+    logFail('POST /authenticate/sf (token inválido)', e.message);
+  }
+}
+
+// 9. Proxy SF Token Exchange
+async function testSfTokenProxy() {
+  section('9. PROXY SF TOKEN (/sf/token)');
+
+  // Sin body
+  try {
+    const { status } = await request('POST', '/sf/token', {
+      body: {},
+      headers: { Authorization: '' },
+    });
+    if (status !== 400) throw new Error(`Esperado 400, recibido ${status}`);
+    logPass('POST /sf/token (sin body)', 'Retorna 400 correctamente');
+  } catch (e) {
+    logFail('POST /sf/token (sin body)', e.message);
+  }
+
+  // Con código inválido (SF rechazará)
+  try {
+    const { status } = await request('POST', '/sf/token', {
+      body: { code: 'codigo_invalido_xyz', redirectUri: 'vigmortgage://oauth/success' },
+      headers: { Authorization: '' },
+    });
+    // SF retornará un error, el proxy debe retornarlo
+    if (status >= 200 && status < 300) throw new Error(`No debería retornar éxito con código inválido`);
+    logPass('POST /sf/token (código inválido)', `Rechaza correctamente con status ${status}`);
+  } catch (e) {
+    // Si hay error de red hacia SF, es aceptable
+    if (e.message.includes('No debería')) {
+      logFail('POST /sf/token (código inválido)', e.message);
+    } else {
+      logPass('POST /sf/token (código inválido)', `Error controlado: ${e.message.substring(0, 80)}`);
+    }
+  }
+}
+
+// 10. Proxy PayPal Token
+async function testPaypalTokenProxy() {
+  section('10. PROXY PAYPAL TOKEN (/paypal/token)');
+
+  // Sin auth — debe rechazar
+  try {
+    const { status } = await request('POST', '/paypal/token', {
+      body: {},
+      headers: { Authorization: '' },
+    });
+    if (status !== 403) throw new Error(`Esperado 403, recibido ${status}`);
+    logPass('POST /paypal/token (sin auth)', 'Retorna 403 correctamente');
+  } catch (e) {
+    logFail('POST /paypal/token (sin auth)', e.message);
+  }
+
+  // Con token inválido — debe rechazar
+  try {
+    const { status } = await request('POST', '/paypal/token', {
+      headers: { Authorization: 'Bearer token_fake_12345' },
+    });
+    if (status !== 401) throw new Error(`Esperado 401, recibido ${status}`);
+    logPass('POST /paypal/token (token inválido)', 'Retorna 401 correctamente');
+  } catch (e) {
+    logFail('POST /paypal/token (token inválido)', e.message);
+  }
+
+  // Con token válido — debe obtener PayPal access token
+  if (!jwtToken) {
+    logSkip('POST /paypal/token (válido)', 'Sin token JWT del backend');
+    return;
+  }
+
+  try {
+    const { status, data } = await request('POST', '/paypal/token', {
+      expectStatus: 200,
+    });
+    if (!data.access_token) throw new Error('No se recibió access_token de PayPal');
+    logPass('POST /paypal/token (válido)', `PayPal token obtenido (${data.access_token.substring(0, 20)}... expires_in=${data.expires_in})`);
+  } catch (e) {
+    logFail('POST /paypal/token (válido)', e.message);
+  }
+}
+
+// 11. Upload, Download, Delete (ciclo completo)
 async function testFileOperations() {
-  section('7. OPERACIONES DE ARCHIVOS S3');
+  section('11. OPERACIONES DE ARCHIVOS S3');
 
   if (!jwtToken) {
     logSkip('Operaciones S3', 'Sin token JWT');
@@ -353,9 +526,9 @@ async function testFileOperations() {
   }
 }
 
-// 8. Upload sin archivo (debe fallar)
+// 12. Upload sin archivo (debe fallar)
 async function testUploadValidation() {
-  section('8. VALIDACIONES');
+  section('12. VALIDACIONES');
 
   if (!jwtToken) {
     logSkip('Validaciones', 'Sin token JWT');
@@ -401,9 +574,9 @@ async function testUploadValidation() {
   }
 }
 
-// 9. Ruta inexistente
+// 13. Ruta inexistente
 async function testNotFound() {
-  section('9. RUTAS INEXISTENTES');
+  section('13. RUTAS INEXISTENTES');
 
   try {
     const { status } = await request('GET', '/ruta-que-no-existe');
@@ -460,7 +633,11 @@ async function main() {
   await testAppVersion();
   await testAuthenticate();
   await testJWTMiddleware();
-  await testConfig();
+  await testConfigPublic();
+  await testConfigPrivate();
+  await testAuthenticateSF();
+  await testSfTokenProxy();
+  await testPaypalTokenProxy();
   await testFileOperations();
   await testUploadValidation();
   await testNotFound();

@@ -147,6 +147,179 @@ app.post('/authenticate', authLimiter, async (req, res) => {
   }
 });
 
+// -------------------- AUTENTICACIÓN POR SALESFORCE TOKEN --------------------
+// La app Flutter envía su SF access token; el backend lo valida contra SF
+// y emite un JWT propio. Así la app nunca necesita el jwt_secret_key.
+app.post('/authenticate/sf', authLimiter, async (req, res) => {
+  try {
+    const { sfAccessToken, sfHost } = req.body;
+    if (!sfAccessToken || !sfHost) {
+      return res.status(400).json({ error: 'sfAccessToken y sfHost son requeridos.' });
+    }
+
+    // Validar que sfHost sea un dominio Salesforce legítimo
+    const allowedHosts = ['my.salesforce.com', 'my.site.com', 'sandbox.my.salesforce.com', 'sandbox.my.site.com'];
+    const hostUrl = new URL(sfHost);
+    const isValidHost = allowedHosts.some(h => hostUrl.hostname.endsWith(h));
+    if (!isValidHost) {
+      return res.status(400).json({ error: 'sfHost no es un dominio Salesforce válido.' });
+    }
+
+    // Verificar el token contra Salesforce
+    const sfResponse = await fetch(`${sfHost}/services/oauth2/userinfo`, {
+      headers: { 'Authorization': `Bearer ${sfAccessToken}` }
+    });
+
+    if (!sfResponse.ok) {
+      return res.status(401).json({ error: 'Token de Salesforce inválido o expirado.' });
+    }
+
+    const sfUser = await sfResponse.json();
+    if (!sfUser.user_id) {
+      return res.status(401).json({ error: 'No se pudo verificar la identidad del usuario.' });
+    }
+
+    // Generar JWT del backend
+    const secrets = await getBackendSecrets();
+    const token = jwt.sign(
+      { sfUserId: sfUser.user_id, email: sfUser.email, source: 'sf' },
+      secrets.jwt_secret_key,
+      { expiresIn: '24h' }
+    );
+
+    return res.json({ token, expiresIn: '24h', userId: sfUser.user_id });
+  } catch (error) {
+    console.error('Error en /authenticate/sf:', error.message);
+    res.status(500).json({ error: 'Error interno del servidor' });
+  }
+});
+
+// -------------------- CONFIG PÚBLICO (sin auth) --------------------
+// Devuelve solo valores no sensibles: hosts, IDs públicos
+app.get('/config/public', async (req, res) => {
+  try {
+    const appConfig = await getAppConfig();
+    // Solo devolver valores públicos (hosts y IDs de cliente)
+    const publicConfig = {
+      node_host: appConfig.node_host || null,
+      sf_host: appConfig.sf_host || null,
+      sf_community_host: appConfig.sf_community_host || null,
+      sf_client_id_ios: appConfig.sf_client_id_ios || null,
+      sf_redirect_url: appConfig.sf_redirect_url || null,
+      ath_public_token: appConfig.ath_public_token || null,
+      paypal_domain_url: appConfig.paypal_domain_url || null,
+      paypal_client_id: appConfig.paypal_client_id || null,
+    };
+    res.json(publicConfig);
+  } catch (error) {
+    console.error('Error en /config/public:', error.message);
+    res.status(500).json({ error: 'Error interno del servidor' });
+  }
+});
+
+// -------------------- CONFIG PRIVADO (con auth) --------------------
+// Devuelve config completa incluyendo valores sensibles
+app.get('/config', verificarJWT, async (req, res) => {
+  try {
+    const appConfig = await getAppConfig();
+    res.json(appConfig);
+  } catch (error) {
+    console.error('Error en /config:', error.message);
+    res.status(500).json({ error: 'Error interno del servidor' });
+  }
+});
+
+// -------------------- PROXY SALESFORCE TOKEN EXCHANGE --------------------
+// La app envía el authorization code; el backend agrega el client_secret
+// y hace el exchange con Salesforce. Así client_secret nunca está en la app.
+app.post('/sf/token', authLimiter, async (req, res) => {
+  try {
+    const { code, redirectUri } = req.body;
+    if (!code || !redirectUri) {
+      return res.status(400).json({ error: 'code y redirectUri son requeridos.' });
+    }
+
+    const appConfig = await getAppConfig();
+    const sfCommunityHost = appConfig.sf_community_host;
+    const sfClientId = appConfig.sf_client_id_ios;
+    const sfClientSecret = appConfig.sf_client_secret_ios;
+
+    if (!sfCommunityHost || !sfClientId || !sfClientSecret) {
+      console.error('Faltan credenciales de Salesforce en Secrets Manager.');
+      return res.status(500).json({ error: 'Configuración de Salesforce incompleta en el servidor.' });
+    }
+
+    const tokenUrl = `${sfCommunityHost}/services/oauth2/token?grant_type=authorization_code&client_id=${sfClientId}&client_secret=${sfClientSecret}&code=${encodeURIComponent(code)}&redirect_uri=${encodeURIComponent(redirectUri)}`;
+
+    const sfResponse = await fetch(tokenUrl, { method: 'POST' });
+    const sfData = await sfResponse.json();
+
+    if (!sfResponse.ok) {
+      return res.status(sfResponse.status).json({
+        error: sfData.error_description || 'Error al obtener token de Salesforce.'
+      });
+    }
+
+    // También generar un JWT del backend para acceso a nuestros endpoints
+    const secrets = await getBackendSecrets();
+    const backendToken = jwt.sign(
+      { source: 'sf', sfAccessToken: sfData.access_token },
+      secrets.jwt_secret_key,
+      { expiresIn: '24h' }
+    );
+
+    return res.json({
+      ...sfData,
+      backend_token: backendToken,
+      backend_token_expires_in: '24h',
+    });
+  } catch (error) {
+    console.error('Error en /sf/token:', error.message);
+    res.status(500).json({ error: 'Error interno del servidor' });
+  }
+});
+
+// -------------------- PROXY PAYPAL TOKEN --------------------
+// La app solicita un token de PayPal a través del backend.
+// El client_id y secret_key de PayPal se mantienen solo en el servidor.
+app.post('/paypal/token', verificarJWT, async (req, res) => {
+  try {
+    const appConfig = await getAppConfig();
+    const paypalDomain = appConfig.paypal_domain_url;
+    const paypalClientId = appConfig.paypal_client_id;
+    const paypalSecret = appConfig.paypal_secret_key;
+
+    if (!paypalDomain || !paypalClientId || !paypalSecret) {
+      console.error('Faltan credenciales de PayPal en Secrets Manager.');
+      return res.status(500).json({ error: 'Configuración de PayPal incompleta en el servidor.' });
+    }
+
+    const basicAuth = Buffer.from(`${paypalClientId}:${paypalSecret}`).toString('base64');
+    const tokenUrl = `${paypalDomain}/v1/oauth2/token?grant_type=client_credentials`;
+
+    const ppResponse = await fetch(tokenUrl, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Basic ${basicAuth}`,
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+    });
+
+    const ppData = await ppResponse.json();
+
+    if (!ppResponse.ok) {
+      return res.status(ppResponse.status).json({
+        error: ppData.error_description || 'Error al obtener token de PayPal.'
+      });
+    }
+
+    return res.json(ppData);
+  } catch (error) {
+    console.error('Error en /paypal/token:', error.message);
+    res.status(500).json({ error: 'Error interno del servidor' });
+  }
+});
+
 // -------------------- MIDDLEWARE PARA VERIFICAR JWT --------------------
 async function verificarJWT(req, res, next) {
   const token = req.headers['authorization']?.split(' ')[1]; // Formato: Bearer <token>

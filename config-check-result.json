@@ -1,0 +1,59 @@
+{
+  "keys": [
+    "min_app_version",
+    "latest_app_version",
+    "force_update",
+    "ath_public_token",
+    "sf_host",
+    "sf_community_host",
+    "sf_client_id_ios",
+    "sf_redirect_url",
+    "paypal_client_id",
+    "paypal_domain_url",
+    "node_host",
+    "sf_client_secret_ios",
+    "paypal_secret_key"
+  ],
+  "checks": [
+    {
+      "field": "sf_host",
+      "exists": true
+    },
+    {
+      "field": "sf_community_host",
+      "exists": true
+    },
+    {
+      "field": "sf_client_id_ios",
+      "exists": true
+    },
+    {
+      "field": "sf_client_secret_ios",
+      "exists": true
+    },
+    {
+      "field": "sf_redirect_url",
+      "exists": true
+    },
+    {
+      "field": "paypal_domain_url",
+      "exists": true
+    },
+    {
+      "field": "paypal_client_id",
+      "exists": true
+    },
+    {
+      "field": "paypal_secret_key",
+      "exists": true
+    },
+    {
+      "field": "ath_public_token",
+      "exists": true
+    },
+    {
+      "field": "node_host",
+      "exists": true
+    }
+  ]
+}
