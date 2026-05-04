@@ -1,5 +1,6 @@
 const express = require('express');
 const { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand } = require('@aws-sdk/client-s3');
+const { SecretsManagerClient, GetSecretValueCommand } = require('@aws-sdk/client-secrets-manager');
 const multer = require('multer');
 const multerS3 = require('multer-s3');
 const morgan = require('morgan');
@@ -16,14 +17,70 @@ require('dotenv').config();
 
 const app = express();
 const port = process.env.PORT || 8080;
-const SECRET_KEY = process.env.JWT_SECRET_KEY;
 const gsExecutable = process.env.GS_EXECUTABLE || 'gs';
 
-// Middleware para parsear JSON a nivel global
+// -------------------- AWS SECRETS MANAGER --------------------
+const smClient = new SecretsManagerClient({
+  region: process.env.AWS_REGION || 'us-east-1',
+  credentials: {
+    accessKeyId: process.env.SM_AWS_ACCESS_KEY_ID || process.env.AWS_ACCESS_KEY_ID,
+    secretAccessKey: process.env.SM_AWS_SECRET_ACCESS_KEY || process.env.AWS_SECRET_ACCESS_KEY,
+  }
+});
+
+// Caché de secretos con TTL de 5 minutos
+const secretsCache = {
+  backend: { data: null, expiry: 0 },
+  appConfig: { data: null, expiry: 0 },
+};
+const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutos
+
+async function getSecret(secretName) {
+  const cacheKey = secretName === 'vigloans/backend' ? 'backend' : 'appConfig';
+  const now = Date.now();
+
+  // Retornar desde caché si aún es válido
+  if (secretsCache[cacheKey].data && secretsCache[cacheKey].expiry > now) {
+    return secretsCache[cacheKey].data;
+  }
+
+  try {
+    const command = new GetSecretValueCommand({ SecretId: secretName });
+    const response = await smClient.send(command);
+    const parsed = JSON.parse(response.SecretString);
+
+    // Guardar en caché
+    secretsCache[cacheKey].data = parsed;
+    secretsCache[cacheKey].expiry = now + CACHE_TTL_MS;
+
+    console.log(`Secreto '${secretName}' cargado correctamente.`);
+    return parsed;
+  } catch (error) {
+    console.error(`Error al obtener secreto '${secretName}':`, error.message);
+
+    // Si hay datos en caché expirados, usarlos como fallback
+    if (secretsCache[cacheKey].data) {
+      console.warn(`Usando caché expirado para '${secretName}'.`);
+      return secretsCache[cacheKey].data;
+    }
+    throw error;
+  }
+}
+
+// Función helper para obtener el secreto del backend
+async function getBackendSecrets() {
+  return getSecret('vigloans/backend');
+}
+
+// Función helper para obtener la configuración de la app
+async function getAppConfig() {
+  return getSecret('vigloans/app-config');
+}
+
+// -------------------- MIDDLEWARE PARA PARSEAR JSON --------------------
 app.use(express.json());
 
 // -------------------- HEALTH CHECK ENDPOINT --------------------
-// Endpoint para el balanceador de carga (ELB/ALB)
 app.get('/health', (req, res) => {
   res.status(200).json({
     status: 'healthy',
@@ -33,9 +90,8 @@ app.get('/health', (req, res) => {
   });
 });
 
-// Endpoint raíz para health checks del balanceador
+// Endpoint raíz para health checks del balanceador (ELB/ALB)
 app.get('/', (req, res) => {
-  // Verificar si es un health check del balanceador
   const userAgent = req.get('user-agent') || '';
   if (userAgent.includes('ELB-HealthChecker') || userAgent.includes('HealthChecker')) {
     return res.status(200).json({ status: 'ok' });
@@ -44,54 +100,84 @@ app.get('/', (req, res) => {
 });
 
 // -------------------- ENDPOINT DE AUTENTICACIÓN --------------------
-// Puedes ajustar la validación de credenciales según tus necesidades.
-// En este ejemplo se utiliza usuario y contraseña fijos.
-app.post('/authenticate', (req, res) => {
-  console.log('req.body', req.body);
-  const { username, password } = req.body;
-  // Validar las credenciales (puedes hacerlo consultando una base de datos, por ejemplo)
-  if (username === 'vigprsalesforce' && password === '5cBJ*THL') {
-    // Genera el token con un payload básico. Puedes incluir la información que requieras.
-    const token = jwt.sign({ username }, SECRET_KEY, { expiresIn: '1h' });
-    return res.json({ token });
+app.post('/authenticate', async (req, res) => {
+  try {
+    const secrets = await getBackendSecrets();
+    const { username, password } = req.body;
+
+    if (username === secrets.auth_user && password === secrets.auth_pass) {
+      const token = jwt.sign({ username }, secrets.jwt_secret_key, { expiresIn: '1h' });
+      return res.json({ token });
+    }
+    res.status(401).json({ error: 'Credenciales inválidas' });
+  } catch (error) {
+    console.error('Error en /authenticate:', error.message);
+    res.status(500).json({ error: 'Error interno del servidor' });
   }
-  res.status(401).json({ error: 'Credenciales inválidas' });
 });
 
 // -------------------- MIDDLEWARE PARA VERIFICAR JWT --------------------
-function verificarJWT(req, res, next) {
+async function verificarJWT(req, res, next) {
   const token = req.headers['authorization']?.split(' ')[1]; // Formato: Bearer <token>
   if (!token) {
     return res.status(403).send({ message: "Token no proporcionado." });
   }
-  jwt.verify(token, SECRET_KEY, (err, decoded) => {
-    if (err) {
-      return res.status(401).send({ message: "Token inválido." });
-    }
-    req.usuario = decoded;
-    next();
-  });
+
+  try {
+    const secrets = await getBackendSecrets();
+    jwt.verify(token, secrets.jwt_secret_key, (err, decoded) => {
+      if (err) {
+        return res.status(401).send({ message: "Token inválido." });
+      }
+      req.usuario = decoded;
+      next();
+    });
+  } catch (error) {
+    console.error('Error al verificar JWT:', error.message);
+    return res.status(500).send({ message: "Error interno del servidor." });
+  }
 }
 
-// -------------------- CONFIGURACIÓN DE AWS SDK --------------------
+// -------------------- CONFIGURACIÓN DE AWS S3 --------------------
 const s3Client = new S3Client({
-  region: 'us-east-1',
+  region: process.env.AWS_REGION || 'us-east-1',
   credentials: {
-    accessKeyId: process.env.AWS_ACCESS_KEY_ID,
-    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+    accessKeyId: process.env.S3_AWS_ACCESS_KEY_ID || process.env.AWS_ACCESS_KEY_ID,
+    secretAccessKey: process.env.S3_AWS_SECRET_ACCESS_KEY || process.env.AWS_SECRET_ACCESS_KEY,
   }
 });
 
+
+
+// -------------------- FUNCIÓN PARA SANITIZAR FILENAMES --------------------
+function sanitizeFilename(filename) {
+  // Remover path traversal y caracteres peligrosos
+  return filename
+    .replace(/\.\./g, '')           // Prevenir path traversal
+    .replace(/[\/\\]/g, '_')        // Reemplazar separadores de path
+    .replace(/[^\w\s.\-()]/g, '_')  // Solo alfanuméricos, espacios, puntos, guiones, paréntesis
+    .trim();
+}
+
 // -------------------- CONFIGURACIÓN DE MULTER --------------------
+// El bucket se inicializa con fallback y se actualiza al cargar secretos
+let uploadBucketName = 'vigpr-sf-prod';
+
 const upload = multer({
   storage: multerS3({
     s3: s3Client,
-    bucket: 'vigpr-sf-prod',
-    contentType: multerS3.AUTO_CONTENT_TYPE, // Autodetecta y establece el Content-Type
+    bucket: function(req, file, cb) {
+      cb(null, uploadBucketName);
+    },
+    contentType: multerS3.AUTO_CONTENT_TYPE,
     key: function (req, file, cb) {
-      cb(null, file.originalname);
+      const safeFilename = sanitizeFilename(file.originalname);
+      cb(null, safeFilename);
     }
-  })
+  }),
+  limits: {
+    fileSize: 200 * 1024 * 1024 // 200MB máximo
+  }
 });
 
 // -------------------- REGISTRO DE SOLICITUDES CON MORGAN --------------------
@@ -114,19 +200,18 @@ app.post('/uploadFile', verificarJWT, upload.single('file'), async (req, res) =>
 
 // -------------------- ENDPOINT PARA DESCARGAR ARCHIVOS DE S3 --------------------
 app.get('/downloadFile/:key', verificarJWT, async (req, res) => {
-  const key = req.params.key;
-  const getParams = {
-    Bucket: 'vigpr-sf-prod',
-    Key: key,
-  };
-
-  console.log('=== DOWNLOAD REQUEST ===');
-  console.log('Key solicitada:', key);
-  console.log('Bucket:', getParams.Bucket);
-  console.log('AWS Access Key en uso:', process.env.AWS_ACCESS_KEY_ID);
-  console.log('========================');
-
   try {
+    const key = req.params.key;
+    const getParams = {
+      Bucket: uploadBucketName,
+      Key: key,
+    };
+
+    console.log('=== DOWNLOAD REQUEST ===');
+    console.log('Key solicitada:', key);
+    console.log('Bucket:', getParams.Bucket);
+    console.log('========================');
+
     const command = new GetObjectCommand(getParams);
     const { Body } = await s3Client.send(command);
     res.setHeader('Content-Disposition', `attachment; filename=${key}`);
@@ -134,19 +219,18 @@ app.get('/downloadFile/:key', verificarJWT, async (req, res) => {
     console.log('✅ Descarga exitosa:', key);
   } catch (err) {
     console.error('❌ Error en downloadFile:', err.message);
-    console.error('Key que falló:', key);
     res.status(500).json({ error: err.message });
   }
 });
 
 // -------------------- ENDPOINT PARA ELIMINAR ARCHIVOS DE S3 --------------------
 app.delete('/deleteFile/:key', verificarJWT, async (req, res) => {
-  const key = req.params.key;
-  const deleteParams = {
-    Bucket: 'vigpr-sf-prod',
-    Key: key,
-  };
   try {
+    const key = req.params.key;
+    const deleteParams = {
+      Bucket: uploadBucketName,
+      Key: key,
+    };
     const command = new DeleteObjectCommand(deleteParams);
     await s3Client.send(command);
     console.log('Archivo eliminado:', key);
@@ -157,7 +241,132 @@ app.delete('/deleteFile/:key', verificarJWT, async (req, res) => {
   }
 });
 
-// -------------------- NUEVO ENDPOINT: MERGE DE PDFs --------------------
+// -------------------- ENDPOINT: VERSIÓN DE LA APP (PÚBLICO) --------------------
+app.get('/app-version', async (req, res) => {
+  try {
+    const config = await getAppConfig();
+    res.json({
+      minVersion: config.min_app_version || '1.0.0',
+      latestVersion: config.latest_app_version || '1.0.0',
+      forceUpdate: config.force_update || false,
+    });
+  } catch (error) {
+    console.error('Error en /app-version:', error.message);
+    res.status(500).json({ error: 'No se pudo obtener la versión de la app' });
+  }
+});
+
+// -------------------- ENDPOINT: CONFIG REMOTA (PROTEGIDO) --------------------
+app.get('/config', verificarJWT, async (req, res) => {
+  try {
+    const config = await getAppConfig();
+    // Solo enviar datos seguros al cliente — nunca secretos del servidor
+    res.json({
+      ath_public_token: config.ath_public_token,
+      sf_host: config.sf_host,
+      sf_community_host: config.sf_community_host,
+      sf_client_id_ios: config.sf_client_id_ios,
+      sf_redirect_url: config.sf_redirect_url,
+      paypal_client_id: config.paypal_client_id,
+      paypal_domain_url: config.paypal_domain_url,
+      node_host: config.node_host,
+    });
+  } catch (error) {
+    console.error('Error en /config:', error.message);
+    res.status(500).json({ error: 'No se pudo obtener la configuración' });
+  }
+});
+
+// -------------------- ENDPOINT: VERIFICAR PAGO ATH MÓVIL --------------------
+app.post('/verifyATHPayment', verificarJWT, async (req, res) => {
+  try {
+    const { referenceNumber, ecommerceId, total, invoiceData } = req.body;
+
+    if (!referenceNumber || !ecommerceId) {
+      return res.status(400).json({ error: 'referenceNumber y ecommerceId son obligatorios.' });
+    }
+
+    const secrets = await getBackendSecrets();
+    const athPrivateToken = secrets.ath_private_token;
+    const athPublicToken = secrets.ath_public_token;
+
+    if (!athPrivateToken || !athPublicToken) {
+      console.error('ATH tokens no configurados en Secrets Manager.');
+      return res.status(500).json({ error: 'Configuración de ATH Móvil incompleta.' });
+    }
+
+    // Crear JWT para autenticarse con la API de ATH Móvil
+    const athJwt = jwt.sign(
+      { publicToken: athPublicToken },
+      athPrivateToken,
+      { expiresIn: '10m' }
+    );
+
+    // Verificar el pago con ATH Móvil API
+    const athResponse = await fetch(
+      'https://payments.athmovil.com/api/business-transaction/ecommerce/business/findPayment',
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${athJwt}`,
+        },
+        body: JSON.stringify({
+          publicToken: athPublicToken,
+          ecommerceId: ecommerceId,
+        }),
+      }
+    );
+
+    if (!athResponse.ok) {
+      const errorText = await athResponse.text();
+      console.error('Error en ATH API:', athResponse.status, errorText);
+      return res.status(400).json({
+        success: false,
+        error: `Error al verificar con ATH Móvil: ${athResponse.status}`,
+      });
+    }
+
+    const athData = await athResponse.json();
+    console.log('Respuesta de ATH Móvil:', JSON.stringify(athData));
+
+    // Verificar que el pago está confirmado
+    if (athData.ecommerceStatus !== 'CONFIRMED' && athData.status !== 'completed') {
+      return res.json({
+        success: false,
+        error: `Pago no confirmado. Estado: ${athData.ecommerceStatus || athData.status}`,
+      });
+    }
+
+    // Verificar que el monto coincide (si se proporcionó)
+    if (total && athData.total) {
+      const expectedTotal = parseFloat(total);
+      const actualTotal = parseFloat(athData.total);
+      if (Math.abs(expectedTotal - actualTotal) > 0.01) {
+        return res.json({
+          success: false,
+          error: `Monto no coincide. Esperado: ${expectedTotal}, Recibido: ${actualTotal}`,
+        });
+      }
+    }
+
+    // Pago verificado exitosamente
+    console.log('✅ Pago ATH verificado:', referenceNumber);
+
+    res.json({
+      success: true,
+      referenceNumber: athData.referenceNumber || referenceNumber,
+      total: athData.total,
+      status: athData.ecommerceStatus || athData.status,
+    });
+
+  } catch (error) {
+    console.error('Error en /verifyATHPayment:', error.message);
+    res.status(500).json({ error: 'Error al verificar el pago' });
+  }
+});
+
+// -------------------- ENDPOINT: MERGE DE PDFs --------------------
 
 // Promisifica el pipeline de streams
 const pipelinePromise = promisify(stream.pipeline);
@@ -197,7 +406,6 @@ async function convertImageToPDF(imageBuffer) {
         console.log('Imagen convertida a PDF exitosamente.');
         resolve(pdfData);
       });
-      // Agrega una página y coloca la imagen. Ajusta dimensiones según sea necesario.
       doc.addPage();
       doc.image(imageBuffer, {
         fit: [500, 700],
@@ -213,7 +421,7 @@ async function convertImageToPDF(imageBuffer) {
 }
 
 // Función para unir varios PDFs utilizando pdf-lib
-async function mergePDFs(pdfBuffers) {
+async function mergePDFBuffers(pdfBuffers) {
   console.log('Iniciando el merge de PDFs...');
   try {
     const mergedPdf = await PDFDocument.create();
@@ -242,7 +450,6 @@ async function optimizePDF(inputBuffer) {
     fs.writeFileSync(tempInput, inputBuffer);
     console.log(`PDF temporal escrito en ${tempInput}`);
 
-    // Comando Ghostscript para optimizar PDF
     const gsCommand = `"${gsExecutable}" -sDEVICE=pdfwrite -dCompatibilityLevel=1.4 -dPDFSETTINGS=/ebook -dNOPAUSE -dQUIET -dBATCH -sOutputFile=${tempOutput} ${tempInput}`;
     console.log(`Ejecutando comando Ghostscript: ${gsCommand}`);
 
@@ -260,28 +467,26 @@ async function optimizePDF(inputBuffer) {
     const optimizedBuffer = fs.readFileSync(tempOutput);
     console.log(`PDF optimizado leído desde ${tempOutput}`);
 
-    // Eliminar archivos temporales
     fs.unlinkSync(tempInput);
     fs.unlinkSync(tempOutput);
     console.log('Archivos temporales eliminados.');
     return optimizedBuffer;
   } catch (error) {
     console.error('Error durante la optimización del PDF:', error.message);
-    // Intentar eliminar archivos temporales en caso de error
     try { fs.unlinkSync(tempInput); } catch (_) {}
     try { fs.unlinkSync(tempOutput); } catch (_) {}
     throw error;
   }
 }
 
-// Función para extraer la key del archivo a partir de la URL (ajusta según la estructura de tus URLs)
+// Función para extraer la key del archivo a partir de la URL
 function extractKeyFromUrl(url) {
   const key = url.split('/').pop();
   console.log(`Key extraída de URL: ${key}`);
   return key;
 }
 
-// Endpoint para hacer merge de PDFs (con conversión de imágenes y optimización)
+// Endpoint para hacer merge de PDFs (con conversión de imágenes)
 app.post('/mergePDFs', verificarJWT, async (req, res) => {
   try {
     console.log('--- Inicio del endpoint /mergePDFs ---');
@@ -291,20 +496,19 @@ app.post('/mergePDFs', verificarJWT, async (req, res) => {
       return res.status(400).json({ error: 'No se proporcionaron URLs.' });
     }
 
-    // Filtramos null, undefined y strings vacíos
     const validUrls = urls.filter(u => typeof u === 'string' && u.trim() !== '');
     if (!validUrls.length) {
       return res.status(400).json({ error: 'No hay URLs válidas para procesar.' });
     }
 
+    const bucketName = await getBucketName();
     const pdfBuffers = [];
     console.log(`Recibidas ${urls.length} URLs para procesar.`);
 
-    // Descarga y procesamiento de cada archivo
     for (const [index, url] of validUrls.entries()) {
       console.log(`Procesando URL ${index + 1}: ${url}`);
       const key = extractKeyFromUrl(url);
-      const getParams = { Bucket: 'vigpr-sf-prod', Key: key };
+      const getParams = { Bucket: bucketName, Key: key };
       try {
         const command = new GetObjectCommand(getParams);
         const { Body } = await s3Client.send(command);
@@ -320,13 +524,11 @@ app.post('/mergePDFs', verificarJWT, async (req, res) => {
           pdfBuffers.push(pdfBuffer);
         }
       } catch (error) {
-        // Si el objeto no existe, lo ignoramos y seguimos con el siguiente
         const isMissing = error.name === 'NoSuchKey' || error.$metadata?.httpStatusCode === 404;
         if (isMissing) {
           console.warn(`El archivo ${key} no existe en S3. Se omite y continúa.`);
           continue;
         }
-        // Para otros errores, respondemos con fallo
         console.error(`Error procesando la URL ${url}:`, error.message);
         return res.status(500).json({ error: `Error procesando el archivo de la URL: ${url}` });
       }
@@ -337,23 +539,16 @@ app.post('/mergePDFs', verificarJWT, async (req, res) => {
       return res.status(400).json({ error: 'Ningún documento válido encontrado para merge.' });
     }
 
-    // Merge de los PDFs
-    const mergedPdfBuffer = await mergePDFs(pdfBuffers);
+    const mergedPdfBuffer = await mergePDFBuffers(pdfBuffers);
     console.log('Merge de PDFs completado.');
 
-    // Se elimina la optimización, por lo que se usará mergedPdfBuffer directamente.
-    // const optimizedPdfBuffer = await optimizePDF(mergedPdfBuffer);
-    // console.log('Optimización del PDF completada.');
-
-    // Genera una key única para el PDF final
     const mergedKey = `merged_${Date.now()}.pdf`;
     console.log(`Key asignada para el PDF final: ${mergedKey}`);
 
-    // Sube el PDF mergeado (sin optimización) a S3
     const uploadParams = {
-      Bucket: 'vigpr-sf-prod',
+      Bucket: bucketName,
       Key: mergedKey,
-      Body: mergedPdfBuffer,  // Usamos el buffer resultante del merge directamente
+      Body: mergedPdfBuffer,
       ContentType: 'application/pdf'
     };
     console.log('Subiendo PDF final a S3...');
@@ -369,29 +564,52 @@ app.post('/mergePDFs', verificarJWT, async (req, res) => {
   }
 });
 
-const server = app.listen(port, () => {
-  console.log(`Servidor escuchando en el puerto: ${port}`);
-});
+// -------------------- INICIAR EL SERVIDOR --------------------
+// Precargar secretos antes de que el servidor acepte conexiones
+async function startServer() {
+  try {
+    // Precargar secretos al inicio
+    console.log('Cargando secretos desde AWS Secrets Manager...');
+    const backendSecrets = await getBackendSecrets();
+    await getAppConfig();
 
-// Configuración de timeouts para producción
-server.timeout = parseInt(process.env.SERVER_TIMEOUT || '120000', 10); // 120 segundos por defecto
-server.keepAliveTimeout = parseInt(process.env.KEEP_ALIVE_TIMEOUT || '65000', 10); // 65 segundos
-server.headersTimeout = parseInt(process.env.HEADERS_TIMEOUT || '66000', 10); // 66 segundos (debe ser > keepAliveTimeout)
-
-// Manejo de errores del servidor
-server.on('error', (err) => {
-  console.error('Error del servidor:', err);
-  if (err.code === 'EADDRINUSE') {
-    console.error(`Puerto ${port} ya está en uso`);
-    process.exit(1);
+    // Actualizar bucket name desde Secrets Manager
+    if (backendSecrets.s3_bucket_name) {
+      uploadBucketName = backendSecrets.s3_bucket_name;
+      console.log(`✅ Bucket S3 configurado: ${uploadBucketName}`);
+    }
+    console.log('✅ Secretos cargados correctamente.');
+  } catch (error) {
+    console.warn('⚠️ No se pudieron cargar los secretos al inicio:', error.message);
+    console.warn('El servidor iniciará con fallbacks. Los secretos se cargarán bajo demanda.');
   }
-});
 
-// Graceful shutdown
-process.on('SIGTERM', () => {
-  console.log('SIGTERM recibido, cerrando servidor...');
-  server.close(() => {
-    console.log('Servidor cerrado');
-    process.exit(0);
+  const server = app.listen(port, () => {
+    console.log(`Servidor escuchando en el puerto: ${port}`);
   });
-});
+
+  // Configuración de timeouts para producción
+  server.timeout = parseInt(process.env.SERVER_TIMEOUT || '120000', 10);
+  server.keepAliveTimeout = parseInt(process.env.KEEP_ALIVE_TIMEOUT || '65000', 10);
+  server.headersTimeout = parseInt(process.env.HEADERS_TIMEOUT || '66000', 10);
+
+  // Manejo de errores del servidor
+  server.on('error', (err) => {
+    console.error('Error del servidor:', err);
+    if (err.code === 'EADDRINUSE') {
+      console.error(`Puerto ${port} ya está en uso`);
+      process.exit(1);
+    }
+  });
+
+  // Graceful shutdown
+  process.on('SIGTERM', () => {
+    console.log('SIGTERM recibido, cerrando servidor...');
+    server.close(() => {
+      console.log('Servidor cerrado');
+      process.exit(0);
+    });
+  });
+}
+
+startServer();

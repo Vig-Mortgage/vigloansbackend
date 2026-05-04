@@ -3,9 +3,13 @@ module.exports = {
     name: "vigloans-backend",
     script: "app.js",
     env: {
-      JWT_SECRET_KEY: process.env.JWT_SECRET_KEY,
-      AWS_ACCESS_KEY_ID: process.env.AWS_ACCESS_KEY_ID,
-      AWS_SECRET_ACCESS_KEY: process.env.AWS_SECRET_ACCESS_KEY
+      AWS_REGION: process.env.AWS_REGION || 'us-east-1',
+      // Secrets Manager
+      SM_AWS_ACCESS_KEY_ID: process.env.SM_AWS_ACCESS_KEY_ID,
+      SM_AWS_SECRET_ACCESS_KEY: process.env.SM_AWS_SECRET_ACCESS_KEY,
+      // S3
+      S3_AWS_ACCESS_KEY_ID: process.env.S3_AWS_ACCESS_KEY_ID,
+      S3_AWS_SECRET_ACCESS_KEY: process.env.S3_AWS_SECRET_ACCESS_KEY,
     }
   }]
 }
