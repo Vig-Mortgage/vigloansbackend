@@ -245,8 +245,8 @@ app.post('/sf/token', authLimiter, async (req, res) => {
 
     const appConfig = await getAppConfig();
     const sfCommunityHost = appConfig.sf_community_host;
-    const sfClientId = appConfig.sf_client_id_ios;
-    const sfClientSecret = appConfig.sf_client_secret_ios;
+    const sfClientId = appConfig.sf_client_id_ios || appConfig.sf_client_id;
+    const sfClientSecret = appConfig.sf_client_secret_ios || appConfig.sf_client_secret;
 
     if (!sfCommunityHost || !sfClientId || !sfClientSecret) {
       console.error('Faltan credenciales de Salesforce en Secrets Manager.');
