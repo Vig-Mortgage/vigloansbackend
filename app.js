@@ -209,6 +209,9 @@ app.get('/config/public', async (req, res) => {
       ath_public_token: appConfig.ath_public_token || null,
       paypal_domain_url: appConfig.paypal_domain_url || null,
       paypal_client_id: appConfig.paypal_client_id || null,
+      minVersion: appConfig.min_app_version || appConfig.min_version || appConfig.minVersion || '1.0.0',
+      latestVersion: appConfig.latest_app_version || appConfig.latest_version || appConfig.latestVersion || '1.0.0',
+      forceUpdate: appConfig.force_update !== undefined ? appConfig.force_update : (appConfig.forceUpdate || false),
     };
     res.json(publicConfig);
   } catch (error) {
@@ -459,9 +462,9 @@ app.get('/app-version', async (req, res) => {
   try {
     const config = await getAppConfig();
     res.json({
-      minVersion: config.min_app_version || '1.0.0',
-      latestVersion: config.latest_app_version || '1.0.0',
-      forceUpdate: config.force_update || false,
+      minVersion: config.min_app_version || config.min_version || config.minVersion || '1.0.0',
+      latestVersion: config.latest_app_version || config.latest_version || config.latestVersion || '1.0.0',
+      forceUpdate: config.force_update !== undefined ? config.force_update : (config.forceUpdate || false),
     });
   } catch (error) {
     console.error('Error en /app-version:', error.message);
@@ -483,6 +486,9 @@ app.get('/config', verificarJWT, async (req, res) => {
       paypal_client_id: config.paypal_client_id,
       paypal_domain_url: config.paypal_domain_url,
       node_host: config.node_host,
+      minVersion: config.min_app_version || config.min_version || config.minVersion || '1.0.0',
+      latestVersion: config.latest_app_version || config.latest_version || config.latestVersion || '1.0.0',
+      forceUpdate: config.force_update !== undefined ? config.force_update : (config.forceUpdate || false),
     });
   } catch (error) {
     console.error('Error en /config:', error.message);
