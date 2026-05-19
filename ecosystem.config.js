@@ -1,8 +1,9 @@
 module.exports = {
   apps: [{
-    name: "vigloans-backend",
+    name: "vigloans-backend-v2",
     script: "app.js",
     env: {
+      PORT: 8081,
       AWS_REGION: process.env.AWS_REGION || 'us-east-1',
       // Secrets Manager
       SM_AWS_ACCESS_KEY_ID: process.env.SM_AWS_ACCESS_KEY_ID,
