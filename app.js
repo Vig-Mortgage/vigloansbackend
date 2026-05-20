@@ -259,8 +259,10 @@ app.post('/sf/token', authLimiter, async (req, res) => {
     const sfData = await sfResponse.json();
 
     if (!sfResponse.ok) {
+      console.error('[SF ERROR] Status:', sfResponse.status, 'Data:', sfData);
       return res.status(sfResponse.status).json({
-        error: sfData.error_description || 'Error al obtener token de Salesforce.'
+        error: sfData.error_description || 'Error al obtener token de Salesforce.',
+        details: sfData
       });
     }
 
