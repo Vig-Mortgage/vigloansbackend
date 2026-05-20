@@ -20,6 +20,14 @@ require('dotenv').config();
 
 const app = express();
 app.set('trust proxy', 1); // Necesario para rate limiting correcto detrás de ELB/proxy
+
+// -------------------- MIDDLEWARE LIMPIEZA DE URL --------------------
+// Evita errores 404 si el cliente envía URLs con múltiples barras (ej. //sf/token)
+app.use((req, res, next) => {
+  req.url = req.url.replace(/\/\/+/g, '/');
+  next();
+});
+
 const port = process.env.PORT || 8080;
 const gsExecutable = process.env.GS_EXECUTABLE || 'gs';
 
