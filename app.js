@@ -510,6 +510,11 @@ app.get('/config', verificarJWT, async (req, res) => {
 app.post('/verifyATHPayment', verificarJWT, async (req, res) => {
   try {
     const { referenceNumber, ecommerceId, total, invoiceData } = req.body;
+    console.log('--- verifyATHPayment Request ---');
+    console.log('referenceNumber:', referenceNumber);
+    console.log('ecommerceId:', ecommerceId);
+    console.log('total:', total);
+    console.log('--------------------------------');
 
     if (!referenceNumber || !ecommerceId) {
       return res.status(400).json({ error: 'referenceNumber y ecommerceId son obligatorios.' });
