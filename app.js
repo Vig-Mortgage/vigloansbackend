@@ -509,12 +509,13 @@ app.get('/config', verificarJWT, async (req, res) => {
 // -------------------- ENDPOINT: VERIFICAR PAGO ATH MÓVIL --------------------
 app.post('/verifyATHPayment', verificarJWT, async (req, res) => {
   try {
-    const { referenceNumber, ecommerceId, total, invoiceData, publicToken } = req.body;
+    const { referenceNumber, ecommerceId, total, invoiceData, publicToken, rawResponse } = req.body;
     console.log('--- verifyATHPayment Request ---');
     console.log('referenceNumber:', referenceNumber);
     console.log('ecommerceId:', ecommerceId);
     console.log('total:', total);
     console.log('client publicToken:', publicToken);
+    console.log('rawResponse:', JSON.stringify(rawResponse, null, 2));
 
     const secrets = await getBackendSecrets();
     const athPrivateToken = secrets.ath_private_token;
