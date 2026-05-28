@@ -509,20 +509,26 @@ app.get('/config', verificarJWT, async (req, res) => {
 // -------------------- ENDPOINT: VERIFICAR PAGO ATH MÓVIL --------------------
 app.post('/verifyATHPayment', verificarJWT, async (req, res) => {
   try {
-    const { referenceNumber, ecommerceId, total, invoiceData } = req.body;
+    const { referenceNumber, ecommerceId, total, invoiceData, publicToken } = req.body;
     console.log('--- verifyATHPayment Request ---');
     console.log('referenceNumber:', referenceNumber);
     console.log('ecommerceId:', ecommerceId);
     console.log('total:', total);
+    console.log('client publicToken:', publicToken);
+
+    const secrets = await getBackendSecrets();
+    const athPrivateToken = secrets.ath_private_token;
+    const athPublicToken = secrets.ath_public_token;
+
+    console.log('backend publicToken (primeros/últimos 4):', athPublicToken ? `${athPublicToken.substring(0, 4)}...${athPublicToken.slice(-4)}` : 'N/A');
+    if (publicToken && athPublicToken && publicToken !== athPublicToken) {
+      console.warn('⚠️ ADVERTENCIA: El publicToken del cliente no coincide con el del backend!');
+    }
     console.log('--------------------------------');
 
     if (!referenceNumber || !ecommerceId) {
       return res.status(400).json({ error: 'referenceNumber y ecommerceId son obligatorios.' });
     }
-
-    const secrets = await getBackendSecrets();
-    const athPrivateToken = secrets.ath_private_token;
-    const athPublicToken = secrets.ath_public_token;
 
     if (!athPrivateToken || !athPublicToken) {
       console.error('ATH tokens no configurados en Secrets Manager.');
