@@ -512,7 +512,11 @@ app.post('/verifyATHPayment', verificarJWT, async (req, res) => {
     const { referenceNumber, ecommerceId, total, invoiceData, publicToken, rawResponse } = req.body;
     console.log('--- verifyATHPayment Request ---');
     console.log('referenceNumber:', referenceNumber);
-    console.log('ecommerceId:', ecommerceId);
+    console.log('ecommerceId (original):', ecommerceId);
+    
+    // Sanitizar el ecommerceId eliminando los guiones para cumplir con las restricciones de Evertec
+    const cleanEcommerceId = ecommerceId ? String(ecommerceId).replace(/-/g, '') : '';
+    console.log('ecommerceId (clean):', cleanEcommerceId);
     console.log('total:', total);
     console.log('client publicToken:', publicToken);
     console.log('rawResponse:', JSON.stringify(rawResponse, null, 2));
@@ -527,7 +531,7 @@ app.post('/verifyATHPayment', verificarJWT, async (req, res) => {
     }
     console.log('--------------------------------');
 
-    if (!referenceNumber || !ecommerceId) {
+    if (!referenceNumber || !cleanEcommerceId) {
       return res.status(400).json({ error: 'referenceNumber y ecommerceId son obligatorios.' });
     }
 
@@ -554,7 +558,7 @@ app.post('/verifyATHPayment', verificarJWT, async (req, res) => {
         },
         body: JSON.stringify({
           publicToken: athPublicToken,
-          ecommerceId: ecommerceId,
+          ecommerceId: cleanEcommerceId,
         }),
       }
     );
