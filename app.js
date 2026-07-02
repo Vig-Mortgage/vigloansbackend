@@ -228,17 +228,7 @@ app.get('/config/public', async (req, res) => {
   }
 });
 
-// -------------------- CONFIG PRIVADO (con auth) --------------------
-// Devuelve config completa incluyendo valores sensibles
-app.get('/config', verificarJWT, async (req, res) => {
-  try {
-    const appConfig = await getAppConfig();
-    res.json(appConfig);
-  } catch (error) {
-    console.error('Error en /config:', error.message);
-    res.status(500).json({ error: 'Error interno del servidor' });
-  }
-});
+
 
 // -------------------- PROXY SALESFORCE TOKEN EXCHANGE --------------------
 // La app envía el authorization code; el backend agrega el client_secret
