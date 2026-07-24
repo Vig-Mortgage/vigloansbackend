@@ -56,15 +56,19 @@ const smClient = new SecretsManagerClient({
 const secretsCache = {
   backend: { data: null, expiry: 0 },
   appConfig: { data: null, expiry: 0 },
+  mail: { data: null, expiry: 0 },
 };
 const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutos
 
 async function getSecret(secretName) {
-  const cacheKey = secretName === 'vigloans/backend' ? 'backend' : 'appConfig';
+  let cacheKey = 'appConfig';
+  if (secretName === 'vigloans/backend') cacheKey = 'backend';
+  else if (secretName === 'Mail' || secretName === 'mail') cacheKey = 'mail';
+
   const now = Date.now();
 
   // Retornar desde caché si aún es válido
-  if (secretsCache[cacheKey].data && secretsCache[cacheKey].expiry > now) {
+  if (secretsCache[cacheKey] && secretsCache[cacheKey].data && secretsCache[cacheKey].expiry > now) {
     return secretsCache[cacheKey].data;
   }
 
@@ -74,6 +78,7 @@ async function getSecret(secretName) {
     const parsed = JSON.parse(response.SecretString);
 
     // Guardar en caché
+    if (!secretsCache[cacheKey]) secretsCache[cacheKey] = { data: null, expiry: 0 };
     secretsCache[cacheKey].data = parsed;
     secretsCache[cacheKey].expiry = now + CACHE_TTL_MS;
 
@@ -83,7 +88,7 @@ async function getSecret(secretName) {
     console.error(`Error al obtener secreto '${secretName}':`, error.message);
 
     // Si hay datos en caché expirados, usarlos como fallback
-    if (secretsCache[cacheKey].data) {
+    if (secretsCache[cacheKey] && secretsCache[cacheKey].data) {
       console.warn(`Usando caché expirado para '${secretName}'.`);
       return secretsCache[cacheKey].data;
     }
@@ -99,6 +104,16 @@ async function getBackendSecrets() {
 // Función helper para obtener la configuración de la app
 async function getAppConfig() {
   return getSecret('vigloans/app-config');
+}
+
+// Función helper para obtener los secretos de correo SMTP2GO (Secreto 'Mail')
+async function getMailSecrets() {
+  try {
+    return await getSecret('Mail');
+  } catch (error) {
+    console.warn('No se pudo cargar el secreto Mail:', error.message);
+    return null;
+  }
 }
 
 // -------------------- MIDDLEWARE DE SEGURIDAD --------------------
@@ -846,9 +861,10 @@ app.post('/support/contact', verificarJWT, async (req, res) => {
     console.log(`[SOPORTE] Recibido mensaje de ${name} (${email}): Asunto: ${subject}`);
 
     // Para enviar el correo, usaremos la API REST oficial de SMTP2GO.
-    // La API key se recupera de manera segura de Secrets Manager bajo el nombre 'smtp2go_api_key'.
+    // La clave se recupera dinámicamente del secreto 'Mail' en AWS Secrets Manager
     const secrets = await getBackendSecrets();
-    const smtp2goKey = secrets.smtp2go_api_key || process.env.SMTP2GO_API_KEY;
+    const mailSecrets = await getMailSecrets();
+    const smtp2goKey = mailSecrets?.MAIL_PASSWORD || secrets.smtp2go_api_key || process.env.SMTP2GO_API_KEY;
 
     if (!smtp2goKey) {
       console.warn('⚠️ SMTP2GO_API_KEY no configurada en Secrets Manager ni envvars. Simulando el envío del correo en consola.');
