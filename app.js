@@ -860,14 +860,15 @@ app.post('/support/contact', verificarJWT, async (req, res) => {
 
     console.log(`[SOPORTE] Recibido mensaje de ${name} (${email}): Asunto: ${subject}`);
 
-    // Para enviar el correo, usaremos la API REST oficial de SMTP2GO.
-    // La clave se recupera dinámicamente del secreto 'Mail' en AWS Secrets Manager
-    const secrets = await getBackendSecrets();
+    // Para enviar el correo, usaremos el cliente SMTP nativo con las credenciales del secreto 'Mail'
     const mailSecrets = await getMailSecrets();
-    const smtp2goKey = mailSecrets?.MAIL_PASSWORD || secrets.smtp2go_api_key || process.env.SMTP2GO_API_KEY;
+    const smtpHost = mailSecrets?.MAIL_HOST || 'mail.smtp2go.com';
+    const smtpPort = mailSecrets?.MAIL_PORT || '2525';
+    const smtpUser = mailSecrets?.MAIL_USERNAME || 'vigmortgage';
+    const smtpPass = mailSecrets?.MAIL_PASSWORD;
 
-    if (!smtp2goKey) {
-      console.warn('⚠️ SMTP2GO_API_KEY no configurada en Secrets Manager ni envvars. Simulando el envío del correo en consola.');
+    if (!smtpPass) {
+      console.warn('⚠️ Credenciales del secreto Mail no encontradas. Simulando el envío del correo en consola.');
       console.log('--- EMAIL SIMULADO ---');
       console.log(`Para: info@vigmortgage.com`);
       console.log(`De: ${name} <${email}>`);
@@ -878,70 +879,36 @@ app.post('/support/contact', verificarJWT, async (req, res) => {
       return res.json({ message: 'Mensaje de soporte enviado exitosamente (Simulado).' });
     }
 
-    // Petición nativa HTTPS a la API REST de SMTP2GO (v3/email/send)
-    const https = require('https');
-    const postData = JSON.stringify({
-      api_key: smtp2goKey,
-      to: ['info@vigmortgage.com'],
-      sender: 'VIG Loans App <info@vigmortgage.com>',
+    // Formato HTML del correo para soporte
+    const htmlTemplate = `<div style="font-family: Arial, sans-serif; padding: 20px; color: #333; max-width: 600px; border: 1px solid #e0e0e0; border-radius: 8px;">
+      <h2 style="color: #0A6FAF; margin-top: 0;">Nuevo Mensaje de Soporte</h2>
+      <p style="color: #666; font-size: 14px;">Recibido desde la aplicación móvil VIG Loans</p>
+      <hr style="border: 0; border-top: 1px solid #eee; margin: 15px 0;" />
+      <p style="margin: 8px 0;"><strong>Nombre:</strong> ${name}</p>
+      <p style="margin: 8px 0;"><strong>Correo de contacto:</strong> <a href="mailto:${email}" style="color: #0A6FAF;">${email}</a></p>
+      <p style="margin: 8px 0;"><strong>Asunto:</strong> ${subject}</p>
+      <div style="background-color: #f8fafc; padding: 15px; border-left: 4px solid #0A6FAF; border-radius: 4px; margin-top: 15px;">
+        <p style="white-space: pre-wrap; margin: 0; font-size: 14px; line-height: 1.5;">${message}</p>
+      </div>
+      <hr style="border: 0; border-top: 1px solid #eee; margin: 20px 0 10px 0;" />
+      <p style="font-size: 12px; color: #999; text-align: center; margin: 0;">Puedes responder a este correo para comunicarte directamente con ${name}.</p>
+    </div>`;
+
+    // Envío usando protocolo SMTP nativo (mail.smtp2go.com)
+    await sendSmtpEmail({
+      host: smtpHost,
+      port: 2525, // Usamos puerto SMTP alternativo de SMTP2GO seguro
+      username: smtpUser,
+      password: smtpPass,
+      from: 'info@vigmortgage.com',
+      to: 'info@vigmortgage.com',
+      replyTo: `${name} <${email}>`,
       subject: `[Soporte App] ${subject}`,
-      text_body: `Mensaje de soporte de VIG Loans App:\n\nNombre: ${name}\nEmail: ${email}\nAsunto: ${subject}\n\nMensaje:\n${message}`,
-      html_body: `<div style="font-family: Arial, sans-serif; padding: 20px; color: #333; max-width: 600px; border: 1px solid #e0e0e0; border-radius: 8px;">
-        <h2 style="color: #0A6FAF; margin-top: 0;">Nuevo Mensaje de Soporte</h2>
-        <p style="color: #666; font-size: 14px;">Recibido desde la aplicación móvil VIG Loans</p>
-        <hr style="border: 0; border-top: 1px solid #eee; margin: 15px 0;" />
-        <p style="margin: 8px 0;"><strong>Nombre:</strong> ${name}</p>
-        <p style="margin: 8px 0;"><strong>Correo de contacto:</strong> <a href="mailto:${email}" style="color: #0A6FAF;">${email}</a></p>
-        <p style="margin: 8px 0;"><strong>Asunto:</strong> ${subject}</p>
-        <div style="background-color: #f8fafc; padding: 15px; border-left: 4px solid #0A6FAF; border-radius: 4px; margin-top: 15px;">
-          <p style="white-space: pre-wrap; margin: 0; font-size: 14px; line-height: 1.5;">${message}</p>
-        </div>
-        <hr style="border: 0; border-top: 1px solid #eee; margin: 20px 0 10px 0;" />
-        <p style="font-size: 12px; color: #999; text-align: center; margin: 0;">Puedes responder a este correo para comunicarte directamente con ${name}.</p>
-      </div>`,
-      custom_headers: [
-        { header: "Reply-To", value: `${name} <${email}>` }
-      ]
+      htmlBody: htmlTemplate,
     });
 
-    const options = {
-      hostname: 'api.smtp2go.com',
-      port: 443,
-      path: '/v3/email/send',
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Content-Length': Buffer.byteLength(postData)
-      }
-    };
-
-    const request = https.request(options, (response) => {
-      let responseData = '';
-      response.on('data', (chunk) => { responseData += chunk; });
-      response.on('end', () => {
-        try {
-          const parsed = JSON.parse(responseData);
-          if (response.statusCode >= 200 && response.statusCode < 300 && parsed.data && parsed.data.succeeded > 0) {
-            console.log('✅ Correo de soporte enviado exitosamente vía SMTP2GO.');
-            return res.json({ message: 'Mensaje de soporte enviado exitosamente.' });
-          } else {
-            console.error(`❌ Error al enviar correo vía SMTP2GO. Status: ${response.statusCode}, Respuesta: ${responseData}`);
-            return res.status(500).json({ error: 'Error al procesar el envío del correo de soporte en el servidor.' });
-          }
-        } catch (parseErr) {
-          console.error(`❌ Error parseando respuesta de SMTP2GO: ${responseData}`);
-          return res.status(500).json({ error: 'Error de respuesta del proveedor de correo.' });
-        }
-      });
-    });
-
-    request.on('error', (e) => {
-      console.error('❌ Error de conexión con la API de SMTP2GO:', e.message);
-      return res.status(500).json({ error: 'Error de red al procesar el envío del correo de soporte.' });
-    });
-
-    request.write(postData);
-    request.end();
+    console.log('✅ Correo de soporte enviado exitosamente vía SMTP2GO (SMTP Nativo).');
+    return res.json({ message: 'Mensaje de soporte enviado exitosamente.' });
 
   } catch (error) {
     console.error('Error en /support/contact:', error.message);
@@ -949,6 +916,78 @@ app.post('/support/contact', verificarJWT, async (req, res) => {
   }
 });
 
+// -------------------- HELPER CLIENTE SMTP NATIVO --------------------
+function sendSmtpEmail({ host, port, username, password, from, to, replyTo, subject, htmlBody }) {
+  return new Promise((resolve, reject) => {
+    const net = require('net');
+    const tls = require('tls');
+
+    const targetPort = parseInt(port || '2525', 10);
+    const targetHost = host || 'mail.smtp2go.com';
+    const isDirectTls = targetPort === 465;
+
+    let client;
+    let step = 0;
+
+    const handleData = (data) => {
+      const response = data.toString();
+
+      if (step === 0 && response.startsWith('220')) {
+        step = 1;
+        client.write('EHLO localhost\r\n');
+      } else if (step === 1 && response.startsWith('250')) {
+        step = 2;
+        client.write('AUTH LOGIN\r\n');
+      } else if (step === 2 && response.startsWith('334')) {
+        step = 3;
+        client.write(Buffer.from(username).toString('base64') + '\r\n');
+      } else if (step === 3 && response.startsWith('334')) {
+        step = 4;
+        client.write(Buffer.from(password).toString('base64') + '\r\n');
+      } else if (step === 4 && response.startsWith('235')) {
+        step = 5;
+        client.write(`MAIL FROM:<${from}>\r\n`);
+      } else if (step === 5 && response.startsWith('250')) {
+        step = 6;
+        client.write(`RCPT TO:<${to}>\r\n`);
+      } else if (step === 6 && response.startsWith('250')) {
+        step = 7;
+        client.write('DATA\r\n');
+      } else if (step === 7 && response.startsWith('354')) {
+        step = 8;
+        const mailContent = [
+          `From: VIG Loans App <${from}>`,
+          `To: <${to}>`,
+          `Reply-To: ${replyTo}`,
+          `Subject: ${subject}`,
+          `MIME-Version: 1.0`,
+          `Content-Type: text/html; charset=UTF-8`,
+          ``,
+          htmlBody,
+          `.`
+        ].join('\r\n') + '\r\n';
+
+        client.write(mailContent);
+      } else if (step === 8 && response.startsWith('250')) {
+        step = 9;
+        client.write('QUIT\r\n');
+        resolve(true);
+      } else if (!response.startsWith('2') && !response.startsWith('3')) {
+        reject(new Error(`Error en comando SMTP (Paso ${step}): ${response.trim()}`));
+        client.end();
+      }
+    };
+
+    if (isDirectTls) {
+      client = tls.connect(targetPort, targetHost, { rejectUnauthorized: false }, () => {});
+    } else {
+      client = net.connect(targetPort, targetHost, () => {});
+    }
+
+    client.on('data', handleData);
+    client.on('error', (err) => reject(err));
+  });
+}
 // -------------------- INICIAR EL SERVIDOR --------------------
 // Precargar secretos antes de que el servidor acepte conexiones
 async function startServer() {
