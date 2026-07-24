@@ -845,16 +845,16 @@ app.post('/support/contact', verificarJWT, async (req, res) => {
 
     console.log(`[SOPORTE] Recibido mensaje de ${name} (${email}): Asunto: ${subject}`);
 
-    // Para enviar el correo, usaremos el servicio de correo transaccional SendGrid.
-    // La API key se recupera de manera segura de Secrets Manager bajo el nombre 'sendgrid_api_key'.
+    // Para enviar el correo, usaremos la API REST oficial de SMTP2GO.
+    // La API key se recupera de manera segura de Secrets Manager bajo el nombre 'smtp2go_api_key'.
     const secrets = await getBackendSecrets();
-    const sendgridKey = secrets.sendgrid_api_key || process.env.SENDGRID_API_KEY;
+    const smtp2goKey = secrets.smtp2go_api_key || process.env.SMTP2GO_API_KEY;
 
-    if (!sendgridKey) {
-      console.warn('⚠️ SENDGRID_API_KEY no configurada. Simulando el envío del correo en consola.');
+    if (!smtp2goKey) {
+      console.warn('⚠️ SMTP2GO_API_KEY no configurada en Secrets Manager ni envvars. Simulando el envío del correo en consola.');
       console.log('--- EMAIL SIMULADO ---');
       console.log(`Para: info@vigmortgage.com`);
-      console.log(`De: ${email}`);
+      console.log(`De: ${name} <${email}>`);
       console.log(`Asunto: [Soporte App] ${subject}`);
       console.log(`Mensaje:\n${message}`);
       console.log('----------------------');
@@ -862,32 +862,38 @@ app.post('/support/contact', verificarJWT, async (req, res) => {
       return res.json({ message: 'Mensaje de soporte enviado exitosamente (Simulado).' });
     }
 
-    // Petición nativa HTTPS a la API de SendGrid
+    // Petición nativa HTTPS a la API REST de SMTP2GO (v3/email/send)
     const https = require('https');
     const postData = JSON.stringify({
-      personalizations: [
-        {
-          to: [{ email: 'info@vigmortgage.com' }],
-          subject: `[Soporte App] ${subject}`
-        }
-      ],
-      from: { email: 'info@vigmortgage.com', name: 'VIG Loans App Support' },
-      reply_to: { email: email, name: name },
-      content: [
-        {
-          type: 'text/plain',
-          value: `Mensaje de soporte de VIG Loans App:\n\nNombre: ${name}\nEmail: ${email}\n\nMensaje:\n${message}`
-        }
+      api_key: smtp2goKey,
+      to: ['info@vigmortgage.com'],
+      sender: 'VIG Loans App <info@vigmortgage.com>',
+      subject: `[Soporte App] ${subject}`,
+      text_body: `Mensaje de soporte de VIG Loans App:\n\nNombre: ${name}\nEmail: ${email}\nAsunto: ${subject}\n\nMensaje:\n${message}`,
+      html_body: `<div style="font-family: Arial, sans-serif; padding: 20px; color: #333; max-width: 600px; border: 1px solid #e0e0e0; border-radius: 8px;">
+        <h2 style="color: #0A6FAF; margin-top: 0;">Nuevo Mensaje de Soporte</h2>
+        <p style="color: #666; font-size: 14px;">Recibido desde la aplicación móvil VIG Loans</p>
+        <hr style="border: 0; border-top: 1px solid #eee; margin: 15px 0;" />
+        <p style="margin: 8px 0;"><strong>Nombre:</strong> ${name}</p>
+        <p style="margin: 8px 0;"><strong>Correo de contacto:</strong> <a href="mailto:${email}" style="color: #0A6FAF;">${email}</a></p>
+        <p style="margin: 8px 0;"><strong>Asunto:</strong> ${subject}</p>
+        <div style="background-color: #f8fafc; padding: 15px; border-left: 4px solid #0A6FAF; border-radius: 4px; margin-top: 15px;">
+          <p style="white-space: pre-wrap; margin: 0; font-size: 14px; line-height: 1.5;">${message}</p>
+        </div>
+        <hr style="border: 0; border-top: 1px solid #eee; margin: 20px 0 10px 0;" />
+        <p style="font-size: 12px; color: #999; text-align: center; margin: 0;">Puedes responder a este correo para comunicarte directamente con ${name}.</p>
+      </div>`,
+      custom_headers: [
+        { header: "Reply-To", value: `${name} <${email}>` }
       ]
     });
 
     const options = {
-      hostname: 'api.sendgrid.com',
+      hostname: 'api.smtp2go.com',
       port: 443,
-      path: '/v3/mail/send',
+      path: '/v3/email/send',
       method: 'POST',
       headers: {
-        'Authorization': `Bearer ${sendgridKey}`,
         'Content-Type': 'application/json',
         'Content-Length': Buffer.byteLength(postData)
       }
@@ -897,18 +903,24 @@ app.post('/support/contact', verificarJWT, async (req, res) => {
       let responseData = '';
       response.on('data', (chunk) => { responseData += chunk; });
       response.on('end', () => {
-        if (response.statusCode >= 200 && response.statusCode < 300) {
-          console.log('✅ Correo de soporte enviado exitosamente vía SendGrid.');
-          return res.json({ message: 'Mensaje de soporte enviado exitosamente.' });
-        } else {
-          console.error(`❌ Error al enviar correo vía SendGrid. Código: ${response.statusCode}, Respuesta: ${responseData}`);
-          return res.status(500).json({ error: 'Error al procesar el envío del correo de soporte en el servidor.' });
+        try {
+          const parsed = JSON.parse(responseData);
+          if (response.statusCode >= 200 && response.statusCode < 300 && parsed.data && parsed.data.succeeded > 0) {
+            console.log('✅ Correo de soporte enviado exitosamente vía SMTP2GO.');
+            return res.json({ message: 'Mensaje de soporte enviado exitosamente.' });
+          } else {
+            console.error(`❌ Error al enviar correo vía SMTP2GO. Status: ${response.statusCode}, Respuesta: ${responseData}`);
+            return res.status(500).json({ error: 'Error al procesar el envío del correo de soporte en el servidor.' });
+          }
+        } catch (parseErr) {
+          console.error(`❌ Error parseando respuesta de SMTP2GO: ${responseData}`);
+          return res.status(500).json({ error: 'Error de respuesta del proveedor de correo.' });
         }
       });
     });
 
     request.on('error', (e) => {
-      console.error('❌ Error de conexión al enviar correo vía SendGrid:', e.message);
+      console.error('❌ Error de conexión con la API de SMTP2GO:', e.message);
       return res.status(500).json({ error: 'Error de red al procesar el envío del correo de soporte.' });
     });
 
