@@ -833,6 +833,94 @@ app.post('/mergePDFs', verificarJWT, async (req, res) => {
   }
 });
 
+// -------------------- ENDPOINT DE CONTACTO DE SOPORTE --------------------
+// Envía un correo con los datos del formulario a info@vigmortgage.com
+app.post('/support/contact', verificarJWT, async (req, res) => {
+  try {
+    const { name, email, subject, message } = req.body;
+
+    if (!name || !email || !subject || !message) {
+      return res.status(400).json({ error: 'Todos los campos son requeridos (name, email, subject, message).' });
+    }
+
+    console.log(`[SOPORTE] Recibido mensaje de ${name} (${email}): Asunto: ${subject}`);
+
+    // Para enviar el correo, usaremos el servicio de correo transaccional SendGrid.
+    // La API key se recupera de manera segura de Secrets Manager bajo el nombre 'sendgrid_api_key'.
+    const secrets = await getBackendSecrets();
+    const sendgridKey = secrets.sendgrid_api_key || process.env.SENDGRID_API_KEY;
+
+    if (!sendgridKey) {
+      console.warn('⚠️ SENDGRID_API_KEY no configurada. Simulando el envío del correo en consola.');
+      console.log('--- EMAIL SIMULADO ---');
+      console.log(`Para: info@vigmortgage.com`);
+      console.log(`De: ${email}`);
+      console.log(`Asunto: [Soporte App] ${subject}`);
+      console.log(`Mensaje:\n${message}`);
+      console.log('----------------------');
+
+      return res.json({ message: 'Mensaje de soporte enviado exitosamente (Simulado).' });
+    }
+
+    // Petición nativa HTTPS a la API de SendGrid
+    const https = require('https');
+    const postData = JSON.stringify({
+      personalizations: [
+        {
+          to: [{ email: 'info@vigmortgage.com' }],
+          subject: `[Soporte App] ${subject}`
+        }
+      ],
+      from: { email: 'info@vigmortgage.com', name: 'VIG Loans App Support' },
+      reply_to: { email: email, name: name },
+      content: [
+        {
+          type: 'text/plain',
+          value: `Mensaje de soporte de VIG Loans App:\n\nNombre: ${name}\nEmail: ${email}\n\nMensaje:\n${message}`
+        }
+      ]
+    });
+
+    const options = {
+      hostname: 'api.sendgrid.com',
+      port: 443,
+      path: '/v3/mail/send',
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${sendgridKey}`,
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(postData)
+      }
+    };
+
+    const request = https.request(options, (response) => {
+      let responseData = '';
+      response.on('data', (chunk) => { responseData += chunk; });
+      response.on('end', () => {
+        if (response.statusCode >= 200 && response.statusCode < 300) {
+          console.log('✅ Correo de soporte enviado exitosamente vía SendGrid.');
+          return res.json({ message: 'Mensaje de soporte enviado exitosamente.' });
+        } else {
+          console.error(`❌ Error al enviar correo vía SendGrid. Código: ${response.statusCode}, Respuesta: ${responseData}`);
+          return res.status(500).json({ error: 'Error al procesar el envío del correo de soporte en el servidor.' });
+        }
+      });
+    });
+
+    request.on('error', (e) => {
+      console.error('❌ Error de conexión al enviar correo vía SendGrid:', e.message);
+      return res.status(500).json({ error: 'Error de red al procesar el envío del correo de soporte.' });
+    });
+
+    request.write(postData);
+    request.end();
+
+  } catch (error) {
+    console.error('Error en /support/contact:', error.message);
+    res.status(500).json({ error: 'Error interno al procesar el contacto de soporte.' });
+  }
+});
+
 // -------------------- INICIAR EL SERVIDOR --------------------
 // Precargar secretos antes de que el servidor acepte conexiones
 async function startServer() {
