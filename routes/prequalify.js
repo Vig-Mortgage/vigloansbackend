@@ -192,28 +192,40 @@ function createPrequalifyRouter({ ports, otpService, sessions } = {}) {
     otpLimiter,
     validate(schemas.otpRequestSchema),
     asyncHandler(async (req, res) => {
-      const { channel, email, phone } = req.validated.body;
-      const destination = channel === 'email' ? email : phone;
+      const { email, phone, phoneChannel } = req.validated.body;
 
-      const resultado = await otpService.requestCode({ channel, destination });
+      // Se piden LOS DOS. Si cualquiera esta en cooldown o bloqueado, se
+      // informa y no se manda ninguno: recibir solo uno de dos codigos es
+      // confuso y ademas gastaria el envio del otro.
+      const [correo, telefono] = await Promise.all([
+        otpService.requestCode({ channel: 'email', destination: email }),
+        // El reto se identifica como 'phone' pase lo que pase; `phoneChannel`
+        // solo decide por donde se entrega. Asi reenviar por WhatsApp no crea
+        // un reto distinto del que se pidio por SMS.
+        otpService.requestCode({
+          channel: 'phone',
+          destination: phone,
+          deliveryChannel: phoneChannel,
+        }),
+      ]);
 
-      // El codigo no aparece por ningun lado: `requestCode` solo devuelve
-      // metadatos y aqui tampoco se agrega nada.
-      if (resultado.result === RequestResult.SENT) {
-        return res.status(202).json({
-          sent: true,
-          expiresInSeconds: resultado.expiresInSeconds,
-        });
+      const problema = [correo, telefono].find((r) => r.result !== RequestResult.SENT);
+      if (problema) {
+        return res
+          .status(429)
+          .set('Retry-After', String(problema.retryAfterSeconds ?? 60))
+          .json({
+            error: 'Espera antes de solicitar otro codigo.',
+            retryAfterSeconds: problema.retryAfterSeconds,
+          });
       }
-      // Cooldown, lockout o tope de envios: el usuario legitimo necesita saber
-      // cuanto esperar, asi que aqui si se informa.
-      return res
-        .status(429)
-        .set('Retry-After', String(resultado.retryAfterSeconds ?? 60))
-        .json({
-          error: 'Espera antes de solicitar otro codigo.',
-          retryAfterSeconds: resultado.retryAfterSeconds,
-        });
+
+      // Ningun codigo aparece aqui: `requestCode` solo devuelve metadatos.
+      res.status(202).json({
+        sent: true,
+        channels: ['email', phoneChannel],
+        expiresInSeconds: correo.expiresInSeconds,
+      });
     })
   );
 
@@ -222,32 +234,40 @@ function createPrequalifyRouter({ ports, otpService, sessions } = {}) {
     otpLimiter,
     validate(schemas.otpVerifySchema),
     asyncHandler(async (req, res) => {
-      const { code, email, phone } = req.validated.body;
-      const channel = email ? 'email' : 'sms';
-      const destination = email ?? phone;
+      const { email, phone, emailCode, phoneCode } = req.validated.body;
 
-      const resultado = await otpService.verifyCode({ channel, destination, code });
+      // Se comprueban los dos SIEMPRE, sin cortocircuito. Si se saliera al
+      // primer fallo, el tiempo de respuesta revelaria cual de los dos codigos
+      // estaba mal, y ademas el canal que si acerto no gastaria intento —
+      // dando barra libre para adivinarlos de uno en uno.
+      const [correo, telefono] = await Promise.all([
+        otpService.verifyCode({ channel: 'email', destination: email, code: emailCode }),
+        otpService.verifyCode({ channel: 'phone', destination: phone, code: phoneCode }),
+      ]);
 
-      if (resultado.result === VerifyResult.LOCKED) {
+      const bloqueado = [correo, telefono].find((r) => r.result === VerifyResult.LOCKED);
+      if (bloqueado) {
         return res
           .status(429)
-          .set('Retry-After', String(resultado.retryAfterSeconds ?? 900))
+          .set('Retry-After', String(bloqueado.retryAfterSeconds ?? 900))
           .json({ error: 'Demasiados intentos. Intenta mas tarde.' });
       }
 
-      if (resultado.result !== VerifyResult.OK) {
-        // INVALID, NOT_FOUND y EXPIRED responden IGUAL: distinguirlos permite
-        // averiguar que telefonos y correos tienen un reto activo.
-        logger.info('prequalify.otp_fallido', { motivo: resultado.result });
+      if (correo.result !== VerifyResult.OK || telefono.result !== VerifyResult.OK) {
+        // No se dice CUAL fallo: distinguirlo permite enumerar que correos y
+        // telefonos tienen un reto activo, y ademas facilita atacarlos por
+        // separado.
+        logger.info('prequalify.otp_fallido', {
+          email: correo.result,
+          phone: telefono.result,
+        });
         return res.status(401).json({ error: OTP_FALLO });
       }
 
-      // Verificado: se localiza o crea el lead y se emite la sesion.
+      // Ambos verificados: se localiza o crea el lead y se emite la sesion.
       const existente = await ports.salesforce.findLeadByEmailOrPhone({ email, phone });
       const lead = existente ?? (await ports.salesforce.createLead({ email, phone }));
 
-      // El paso `otpVerify` se marca aqui: es el unico sitio donde se verifica.
-      // Sin esto ningun paso posterior seria entrable.
       const previos = (await ports.salesforce.getLead(lead.id))?.completedSteps ?? [];
       await ports.salesforce.updateLead(lead.id, {
         completedSteps: [...new Set([...previos, Step.OTP_VERIFY])],

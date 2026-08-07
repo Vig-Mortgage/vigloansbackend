@@ -142,20 +142,30 @@ test('startSchema exige nombre y apellido', () => {
 
 // --- OTP ------------------------------------------------------------------
 
-test('otpRequestSchema exige telefono para sms/whatsapp y email para email', () => {
-  assert.equal(ok(otpRequestSchema, { channel: 'sms', phone: '7871234567' }).success, true);
-  assert.equal(ok(otpRequestSchema, { channel: 'email', email: 'a@b.com' }).success, true);
-  falla(otpRequestSchema, { channel: 'sms' });
-  falla(otpRequestSchema, { channel: 'whatsapp', email: 'a@b.com' });
-  falla(otpRequestSchema, { channel: 'email', phone: '7871234567' });
-  falla(otpRequestSchema, { channel: 'paloma' });
+test('otpRequestSchema exige correo Y telefono: se verifican los dos', () => {
+  const completo = { email: 'a@b.com', phone: '7871234567' };
+  assert.equal(ok(otpRequestSchema, completo).success, true);
+  // La via del telefono por defecto es SMS.
+  assert.equal(ok(otpRequestSchema, completo).data.phoneChannel, 'sms');
+  assert.equal(ok(otpRequestSchema, { ...completo, phoneChannel: 'whatsapp' }).success, true);
+
+  falla(otpRequestSchema, { email: 'a@b.com' });          // sin telefono
+  falla(otpRequestSchema, { phone: '7871234567' });        // sin correo
+  falla(otpRequestSchema, { ...completo, phoneChannel: 'paloma' });
+  falla(otpRequestSchema, {});
 });
 
-test('otpVerifySchema exige 6 digitos y un identificador', () => {
-  assert.equal(ok(otpVerifySchema, { code: '123456', email: 'a@b.com' }).success, true);
-  falla(otpVerifySchema, { code: '12345', email: 'a@b.com' });
-  falla(otpVerifySchema, { code: 'abcdef', email: 'a@b.com' });
-  falla(otpVerifySchema, { code: '123456' }); // sin email ni telefono
+test('otpVerifySchema exige AMBOS codigos de 6 digitos', () => {
+  const base = { email: 'a@b.com', phone: '7871234567' };
+  assert.equal(
+    ok(otpVerifySchema, { ...base, emailCode: '123456', phoneCode: '654321' }).success,
+    true
+  );
+  falla(otpVerifySchema, { ...base, emailCode: '123456' });                  // falta el del telefono
+  falla(otpVerifySchema, { ...base, phoneCode: '123456' });                  // falta el del correo
+  falla(otpVerifySchema, { ...base, emailCode: '12345', phoneCode: '654321' });
+  falla(otpVerifySchema, { ...base, emailCode: 'abcdef', phoneCode: '654321' });
+  falla(otpVerifySchema, { emailCode: '123456', phoneCode: '654321' });      // sin destinatarios
 });
 
 // --- personal -------------------------------------------------------------

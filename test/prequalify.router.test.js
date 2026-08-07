@@ -100,17 +100,32 @@ const IDENTIDAD = {
   loanPurpose: 'Compra',
 };
 
-/** Recorre OTP -> verify y devuelve la sesion (sin completar `start`). */
-async function autenticar(app, entregas, email = 'juan@example.com') {
-  await call(app, 'POST', '/prequalify/otp', { body: { channel: 'email', email } });
-  const code = entregas.at(-1).code;
-  const res = await call(app, 'POST', '/prequalify/otp/verify', { body: { code, email } });
+/** Codigo entregado por un canal concreto, del envio mas reciente. */
+function codigoDe(entregas, canal) {
+  return [...entregas].reverse().find((e) => e.channel === canal)?.code;
+}
+
+/**
+ * Recorre OTP -> verify y devuelve la sesion (sin completar `start`).
+ *
+ * Se verifican AMBOS canales: el backend no emite sesion con uno solo.
+ */
+async function autenticar(app, entregas, email = 'juan@example.com', phone = '7871234567') {
+  await call(app, 'POST', '/prequalify/otp', { body: { email, phone } });
+  const res = await call(app, 'POST', '/prequalify/otp/verify', {
+    body: {
+      email,
+      phone,
+      emailCode: codigoDe(entregas, 'email'),
+      phoneCode: codigoDe(entregas, 'sms'),
+    },
+  });
   return res.body;
 }
 
 /** Autentica y ademas completa `start`, que es el punto de partida real. */
-async function arrancar(app, entregas, email = 'juan@example.com') {
-  const sesion = await autenticar(app, entregas, email);
+async function arrancar(app, entregas, email = 'juan@example.com', phone = '7871234567') {
+  const sesion = await autenticar(app, entregas, email, phone);
   await call(app, 'POST', '/prequalify/leads', {
     token: sesion.token,
     body: { ...IDENTIDAD, email },
@@ -124,24 +139,26 @@ test('POST /otp responde 202 y NUNCA incluye el codigo', async () => {
   const entregas = [];
   const { app } = buildApp({ otpEntregas: entregas });
   const res = await call(app, 'POST', '/prequalify/otp', {
-    body: { channel: 'sms', phone: '7871234567' },
+    body: { email: 'juan@example.com', phone: '7871234567' },
   });
 
   assert.equal(res.status, 202);
-  assert.deepEqual(Object.keys(res.body).sort(), ['expiresInSeconds', 'sent']);
+  assert.deepEqual(Object.keys(res.body).sort(), ['channels', 'expiresInSeconds', 'sent']);
+  assert.equal(entregas.length, 2, 'un codigo al correo y otro al telefono');
   assert.ok(!res.raw.includes(entregas.at(-1).code));
 });
 
 test('POST /otp valida el payload con zod', async () => {
   const { app } = buildApp();
   assert.equal((await call(app, 'POST', '/prequalify/otp', { body: {} })).status, 400);
+  // falta el telefono
   assert.equal(
-    (await call(app, 'POST', '/prequalify/otp', { body: { channel: 'paloma' } })).status,
+    (await call(app, 'POST', '/prequalify/otp', { body: { email: 'a@b.com' } })).status,
     400
   );
-  // sms sin telefono
+  // falta el correo
   assert.equal(
-    (await call(app, 'POST', '/prequalify/otp', { body: { channel: 'sms' } })).status,
+    (await call(app, 'POST', '/prequalify/otp', { body: { phone: '7871234567' } })).status,
     400
   );
 });
@@ -149,29 +166,32 @@ test('POST /otp valida el payload con zod', async () => {
 test('reenviar antes del cooldown da 429 con Retry-After', async () => {
   const entregas = [];
   const { app } = buildApp({ otpEntregas: entregas });
-  const body = { channel: 'sms', phone: '7871234567' };
+  const body = { email: 'juan@example.com', phone: '7871234567' };
   await call(app, 'POST', '/prequalify/otp', { body });
 
   const res = await call(app, 'POST', '/prequalify/otp', { body });
   assert.equal(res.status, 429);
   assert.ok(Number(res.headers.get('retry-after')) > 0);
-  assert.equal(entregas.length, 1);
+  assert.equal(entregas.length, 2, 'no se reenvia ninguno de los dos');
 });
 
 test('el codigo correcto emite sesion; el malo da 401', async () => {
   const entregas = [];
   const { app } = buildApp({ otpEntregas: entregas });
-  await call(app, 'POST', '/prequalify/otp', {
-    body: { channel: 'email', email: 'juan@example.com' },
-  });
+  const contacto = { email: 'juan@example.com', phone: '7871234567' };
+  await call(app, 'POST', '/prequalify/otp', { body: contacto });
 
   const malo = await call(app, 'POST', '/prequalify/otp/verify', {
-    body: { code: '000000', email: 'juan@example.com' },
+    body: { ...contacto, emailCode: '000000', phoneCode: '000000' },
   });
   assert.equal(malo.status, 401);
 
   const bueno = await call(app, 'POST', '/prequalify/otp/verify', {
-    body: { code: entregas.at(-1).code, email: 'juan@example.com' },
+    body: {
+      ...contacto,
+      emailCode: codigoDe(entregas, 'email'),
+      phoneCode: codigoDe(entregas, 'sms'),
+    },
   });
   assert.equal(bueno.status, 200);
   assert.ok(bueno.body.token);
@@ -184,14 +204,20 @@ test('codigo malo y codigo inexistente dan la MISMA respuesta', async () => {
   const { app } = buildApp({ otpEntregas: entregas });
 
   const sinReto = await call(app, 'POST', '/prequalify/otp/verify', {
-    body: { code: '123456', email: 'nadie@example.com' },
+    body: {
+      email: 'nadie@example.com', phone: '7870000000',
+      emailCode: '123456', phoneCode: '123456',
+    },
   });
 
   await call(app, 'POST', '/prequalify/otp', {
-    body: { channel: 'email', email: 'juan@example.com' },
+    body: { email: 'juan@example.com', phone: '7871234567' },
   });
   const conReto = await call(app, 'POST', '/prequalify/otp/verify', {
-    body: { code: '000000', email: 'juan@example.com' },
+    body: {
+      email: 'juan@example.com', phone: '7871234567',
+      emailCode: '000000', phoneCode: '000000',
+    },
   });
 
   assert.equal(sinReto.status, conReto.status);
@@ -222,7 +248,7 @@ test('IDOR: la sesion de un lead no puede tocar el lead de otro', async () => {
 
   const juan = await autenticar(app, entregas, 'juan@example.com');
   // Segundo lead, con su propia sesion.
-  const ana = await autenticar(app, entregas, 'ana@example.com');
+  const ana = await autenticar(app, entregas, 'ana@example.com', '7879999999');
   assert.notEqual(juan.leadId, ana.leadId);
 
   const res = await call(app, 'PATCH', `/prequalify/leads/${ana.leadId}/personal`, {
@@ -535,8 +561,8 @@ test('POST /leads/:id/submit existe y respeta la maquina de estados', async () =
 test('submit tambien respeta la autorizacion por recurso', async () => {
   const entregas = [];
   const { app } = buildApp({ otpEntregas: entregas });
-  const juan = await arrancar(app, entregas, 'juan@example.com');
-  const ana = await arrancar(app, entregas, 'ana@example.com');
+  const juan = await arrancar(app, entregas, 'juan@example.com', '7871234567');
+  const ana = await arrancar(app, entregas, 'ana@example.com', '7879999999');
 
   const res = await call(app, 'POST', `/prequalify/leads/${ana.leadId}/submit`, {
     token: juan.token,
@@ -617,5 +643,91 @@ test('un origen permitido si recibe su ACAO, y nunca `*`', async () => {
   } finally {
     if (previo === undefined) delete process.env.PREQUALIFY_CORS_ORIGINS;
     else process.env.PREQUALIFY_CORS_ORIGINS = previo;
+  }
+});
+
+// --- doble verificacion: hacen falta LOS DOS -----------------------------
+
+test('un solo codigo correcto NO basta: hay que verificar correo y telefono', async () => {
+  const entregas = [];
+  const { app } = buildApp({ otpEntregas: entregas });
+  const contacto = { email: 'juan@example.com', phone: '7871234567' };
+  await call(app, 'POST', '/prequalify/otp', { body: contacto });
+
+  // Correo bien, telefono mal.
+  const soloCorreo = await call(app, 'POST', '/prequalify/otp/verify', {
+    body: { ...contacto, emailCode: codigoDe(entregas, 'email'), phoneCode: '000000' },
+  });
+  assert.equal(soloCorreo.status, 401);
+  assert.equal(soloCorreo.body.token, undefined);
+
+  // Telefono bien, correo mal.
+  const soloTelefono = await call(app, 'POST', '/prequalify/otp/verify', {
+    body: { ...contacto, emailCode: '000000', phoneCode: codigoDe(entregas, 'sms') },
+  });
+  assert.equal(soloTelefono.status, 401);
+  assert.equal(soloTelefono.body.token, undefined);
+});
+
+test('no se revela CUAL de los dos codigos fallo', async () => {
+  const entregas = [];
+  const { app } = buildApp({ otpEntregas: entregas });
+  const contacto = { email: 'juan@example.com', phone: '7871234567' };
+  await call(app, 'POST', '/prequalify/otp', { body: contacto });
+
+  const a = await call(app, 'POST', '/prequalify/otp/verify', {
+    body: { ...contacto, emailCode: codigoDe(entregas, 'email'), phoneCode: '000000' },
+  });
+  const b = await call(app, 'POST', '/prequalify/otp/verify', {
+    body: { ...contacto, emailCode: '000000', phoneCode: '111111' },
+  });
+  assert.deepEqual(a.body, b.body, 'la respuesta debe ser identica');
+});
+
+test('el reto del telefono no depende de la via de entrega', async () => {
+  // Se pide por WhatsApp; el reto se guarda como `phone`, asi que verificar
+  // sigue funcionando. Antes se guardaba bajo el canal de entrega y no cuadraba.
+  const entregas = [];
+  const { app } = buildApp({ otpEntregas: entregas });
+  const contacto = { email: 'juan@example.com', phone: '7871234567' };
+  await call(app, 'POST', '/prequalify/otp', {
+    body: { ...contacto, phoneChannel: 'whatsapp' },
+  });
+  assert.ok(codigoDe(entregas, 'whatsapp'), 'se entrego por WhatsApp');
+
+  const res = await call(app, 'POST', '/prequalify/otp/verify', {
+    body: {
+      ...contacto,
+      emailCode: codigoDe(entregas, 'email'),
+      phoneCode: codigoDe(entregas, 'whatsapp'),
+    },
+  });
+  assert.equal(res.status, 200);
+  assert.ok(res.body.token);
+});
+
+// --- los errores de validacion dicen QUE campo ---------------------------
+
+test('un 400 identifica el campo, no solo "Parametros invalidos"', async () => {
+  const { app } = buildApp();
+  const res = await call(app, 'POST', '/prequalify/otp', {
+    body: { email: 'no-es-email', phone: '123' },
+  });
+
+  assert.equal(res.status, 400);
+  assert.ok(Array.isArray(res.body.details), 'debe traer detalle por campo');
+  const campos = res.body.details.map((d) => d.path);
+  assert.ok(campos.includes('email'));
+  assert.ok(campos.includes('phone'));
+});
+
+test('los mensajes de campo requerido vienen en espanol', async () => {
+  // zod responde "Required" en ingles por defecto y ese texto acaba en la
+  // pantalla del solicitante.
+  const { app } = buildApp();
+  const res = await call(app, 'POST', '/prequalify/otp', { body: {} });
+
+  for (const d of res.body.details) {
+    assert.ok(!/^required$/i.test(d.message), `sin traducir: ${d.path} -> ${d.message}`);
   }
 });
