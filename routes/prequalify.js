@@ -35,6 +35,9 @@ const {
   toLegacyStep,
 } = require('../lib/prequalify/stateMachine');
 const schemas = require('../lib/prequalify/schemas');
+// El parseo del reporte vive en el dominio, no en el adaptador: este router
+// solo lo invoca y guarda los dos numeros que sobreviven al reporte.
+const { parseCreditReport, toDecisionInput } = require('../lib/prequalify/experian');
 
 /** Mensaje unico para todo fallo de verificacion de OTP (anti-enumeracion). */
 const OTP_FALLO = 'El codigo no es valido o expiro. Solicita uno nuevo.';
@@ -353,36 +356,55 @@ function createPrequalifyRouter({ ports, otpService, sessions } = {}) {
     validate(LeadIdParams, 'params'),
     authorizeLead,
     requireStep(Step.CREDIT_CHECK),
+    validate(schemas.creditCheckSchema),
     asyncHandler(async (req, res) => {
-      // TODO(Roberto): faltan DOS cosas para cerrar este paso, y ninguna es el
-      // proveedor — el adaptador de Experian ya esta escrito, cableado y
-      // probado contra UAT con reportes reales.
-      //
-      // 1. EL ADAPTADOR DE SALESFORCE. `fetchCreditReport` necesita nombre,
-      //    apellido, fecha de nacimiento y direccion del solicitante. Eso vive
-      //    en el Lead, y hoy no hay con que leerlo.
-      //
-      // 2. DE DONDE SALE EL SSN. Es una decision de diseno, no un cableado.
-      //    El SSN se escribe en Salesforce y **nunca se relee** a proposito
-      //    (`salesforceMapper.js`, SENSITIVE_LEAD_FIELDS), asi que no se puede
-      //    recuperar de ahi para la consulta. Las opciones:
-      //
-      //      a) Que el cliente lo reenvie en esta peticion, como hacia el
-      //         legacy (`scripts.js:1010-1029`). Simple, pero el SSN vuelve a
-      //         viajar por la red y a estar en memoria del navegador.
-      //      b) Guardarlo server-side entre el paso `personal` y este, atado a
-      //         la sesion y con vida corta. No vuelve a viajar, pero hay que
-      //         decidir donde vive (hoy el almacen de OTP es en memoria y no
-      //         sirve multi-instancia) y garantizar que se borra.
-      //
-      //    (b) es mejor para el dato pero exige infraestructura; (a) es lo que
-      //    ya funciona en produccion hoy. Hay que elegir antes de escribir el
-      //    codigo, porque el contrato del endpoint cambia segun la opcion.
-      //
-      // Mientras tanto se responde 501 explicitamente, sin llamar al puerto:
-      // llamarlo con datos incompletos daria un 502 de Experian y haria pensar
-      // que el problema es del proveedor.
-      res.status(501).json({ error: 'Este servicio no esta disponible en este momento.' });
+      const leadId = req.prequal.leadId;
+
+      // El SSN llega en esta peticion, no de Salesforce: se escribe alli pero
+      // nunca se relee (`SENSITIVE_LEAD_FIELDS`). Ver `creditCheckSchema`.
+      const { ssn } = req.validated.body;
+
+      // La identidad y la direccion SI salen del lead: son datos que el
+      // solicitante ya confirmo en pasos anteriores, y aceptarlos del cliente
+      // aqui permitiria pedir el reporte de otra persona con la misma sesion.
+      const lead = req.lead;
+      const direccion = lead.currentAddress ?? {};
+
+      const reporte = await ports.experian.fetchCreditReport({
+        firstName: lead.firstName,
+        lastName: lead.lastName,
+        dob: lead.dob,
+        ssn,
+        address: {
+          line1: direccion.line1,
+          city: direccion.city,
+          state: direccion.state,
+          zipCode: direccion.zipCode,
+        },
+      });
+
+      // El reporte crudo muere aqui: se parsea y se guardan dos numeros. No se
+      // serializa a la respuesta ni al log — trae el historial de deudas
+      // completo de una persona.
+      const perfil = parseCreditReport(reporte);
+      const { score, monthlyDebtPayments } = toDecisionInput(perfil);
+
+      logger.info('prequalify.credit_check', {
+        // Ni el score ni el SSN. Solo que el reporte vino con contenido, que es
+        // lo que hace falta para saber si el proveedor responde bien.
+        tradelines: perfil.tradelines?.length ?? 0,
+        conScore: Number.isFinite(score) && score > 0,
+      });
+
+      // La DECISION no se emite aqui: hace falta el ingreso, que se pide dos
+      // pasos mas adelante. Es el mismo orden del legacy — Experian en el paso
+      // 3, calificacion en el 5 (`accionIncome.php:365`). Por eso los dos
+      // numeros se persisten: sin ellos habria que volver a consultar el buro
+      // por la misma persona.
+      await applyStep(req, res, Step.CREDIT_CHECK, {
+        creditScore: score,
+        monthlyDebtPayments,
+      });
     })
   );
 

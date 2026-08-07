@@ -31,13 +31,34 @@ function fakeSalesforce(inicial = {}) {
       leads.set(lead.id, lead);
       return { id: lead.id };
     },
-    getLead: async (id) => leads.get(id) ?? null,
+    getLead: async (id) => {
+      const lead = leads.get(id);
+      if (!lead) return null;
+      // El adaptador real devuelve la direccion ANIDADA (`fromLeadRecord` la
+      // arma como `currentAddress: {...}`) aunque el paso la envie plana. El
+      // fake replica esa forma: si devolviera lo plano tal cual, el handler
+      // leeria `lead.currentAddress.line1` como undefined en los tests y bien
+      // en produccion.
+      const { line1, city, state, zipCode, housing, rentMonth, years, months } = lead;
+      const direccion = { line1, city, state, zipCode, housing, rentMonth, years, months };
+      const tieneDireccion = Object.values(direccion).some((v) => v !== undefined);
+      return tieneDireccion ? { ...lead, currentAddress: direccion } : lead;
+    },
     updateLead: async (id, fields) => {
       const lead = leads.get(id);
       if (!lead) return;
       const { completedSteps, ...resto } = fields;
       if (completedSteps) lead.completedSteps = completedSteps;
-      Object.assign(lead, { campos: { ...(lead.campos ?? {}), ...resto } });
+      // Los campos se guardan DOS veces a proposito:
+      //
+      //  - Planos, porque asi los devuelve el adaptador real: `fromLeadRecord`
+      //    entrega el modelo de la API con `dob`, `firstName` y `currentAddress`
+      //    en la raiz. Un fake que solo los anidara haria que `req.lead.dob`
+      //    fuera undefined en los tests y no en produccion — el doble mintiendo
+      //    sobre la pieza real, que es como se colaron ya dos fallos.
+      //  - Bajo `campos`, que es lo que inspeccionan los tests que comprueban
+      //    QUE se escribio en cada paso.
+      Object.assign(lead, resto, { campos: { ...(lead.campos ?? {}), ...resto } });
     },
     setCurrentStep: async () => {},
   };
@@ -730,4 +751,153 @@ test('los mensajes de campo requerido vienen en espanol', async () => {
   for (const d of res.body.details) {
     assert.ok(!/^required$/i.test(d.message), `sin traducir: ${d.path} -> ${d.message}`);
   }
+});
+
+// --- credit-check ---------------------------------------------------------
+
+/** Lleva el lead hasta poder entrar al paso de credito. */
+async function hastaCredito(app, entregas) {
+  // `arrancar` y no `autenticar`: hace falta completar tambien el paso `start`.
+  const sesion = await arrancar(app, entregas);
+  await call(app, 'PATCH', `/prequalify/leads/${sesion.leadId}/personal`, {
+    token: sesion.token,
+    body: {
+      dob: '1985-06-15', ssn: '123-45-6789', citizenship: 'U.S. Citizen',
+      maritalStatus: 'Single', dependents: 0, typeOfCredit: 'IndividualCredit',
+    },
+  });
+  await call(app, 'PUT', `/prequalify/leads/${sesion.leadId}/addresses`, {
+    token: sesion.token,
+    body: {
+      line1: 'CALLE LUNA 12', city: 'Ponce', state: 'PR', zipCode: '00731',
+      housing: 'Own', years: 5, months: 0,
+    },
+  });
+  return sesion;
+}
+
+/** Reporte minimo con un score y un tradeline con pago mensual. */
+const REPORTE = {
+  creditProfile: [
+    {
+      riskModel: [{ modelIndicator: 'AF', score: '712' }],
+      tradeline: [{ monthlyPaymentAmount: '350', accountType: '18', openOrClosed: 'O' }],
+    },
+  ],
+};
+
+test('credit-check manda al buro la identidad DEL LEAD y el SSN de la peticion', async () => {
+  const pedidos = [];
+  const entregas = [];
+  const { app } = buildApp({
+    otpEntregas: entregas,
+    experian: {
+      fetchCreditReport: async (solicitante) => {
+        pedidos.push(solicitante);
+        return REPORTE;
+      },
+    },
+  });
+  const sesion = await hastaCredito(app, entregas);
+
+  const res = await call(app, 'POST', `/prequalify/leads/${sesion.leadId}/credit-check`, {
+    token: sesion.token,
+    body: { ssn: '123-45-6789' },
+  });
+
+  assert.equal(res.status, 200, res.raw);
+  assert.equal(pedidos.length, 1);
+
+  // El SSN viene del cuerpo; el resto, del lead. Aceptar la identidad del
+  // cliente permitiria pedir el reporte de otra persona con la misma sesion.
+  // Normalizado por zod: nueve digitos sin guiones (`schemas.js` primitiva ssn).
+  assert.equal(pedidos[0].ssn, '123456789');
+  assert.equal(pedidos[0].dob, '1985-06-15');
+  assert.equal(pedidos[0].address.zipCode, '00731');
+  assert.equal(pedidos[0].address.city, 'Ponce');
+});
+
+test('credit-check exige el SSN y lo valida', async () => {
+  const entregas = [];
+  const { app } = buildApp({
+    otpEntregas: entregas,
+    experian: { fetchCreditReport: async () => REPORTE },
+  });
+  const sesion = await hastaCredito(app, entregas);
+
+  const sinSsn = await call(app, 'POST', `/prequalify/leads/${sesion.leadId}/credit-check`, {
+    token: sesion.token, body: {},
+  });
+  assert.equal(sinSsn.status, 400);
+
+  const malo = await call(app, 'POST', `/prequalify/leads/${sesion.leadId}/credit-check`, {
+    token: sesion.token, body: { ssn: '000-00-0000' },
+  });
+  assert.equal(malo.status, 400);
+});
+
+test('credit-check guarda score y deuda, y NO los devuelve al cliente', async () => {
+  const entregas = [];
+  const { app, sf } = buildApp({
+    otpEntregas: entregas,
+    experian: { fetchCreditReport: async () => REPORTE },
+  });
+  const sesion = await hastaCredito(app, entregas);
+
+  const res = await call(app, 'POST', `/prequalify/leads/${sesion.leadId}/credit-check`, {
+    token: sesion.token, body: { ssn: '123-45-6789' },
+  });
+
+  assert.equal(res.status, 200);
+  // Persistido para la decision posterior, que ocurre en el paso de ingresos.
+  // El fake guarda lo que llega a `updateLead` bajo `campos`.
+  const guardado = sf.leads.get(sesion.leadId).campos;
+  assert.equal(guardado.creditScore, 712);
+  assert.equal(guardado.monthlyDebtPayments, 350);
+
+  // Pero nada de eso sale: el score es dato de credito.
+  assert.ok(!res.raw.includes('712'), 'el score no debe salir al cliente');
+  assert.ok(!res.raw.includes('350'), 'la deuda no debe salir al cliente');
+  assert.ok(!res.raw.includes('123456789') && !res.raw.includes('123-45-6789'));
+});
+
+test('el reporte crudo nunca se serializa al cliente', async () => {
+  const entregas = [];
+  const conRastro = {
+    creditProfile: [{
+      riskModel: [{ modelIndicator: 'AF', score: '650' }],
+      tradeline: [{ monthlyPaymentAmount: '100', subscriberName: 'BANCO SECRETO SA' }],
+    }],
+  };
+  const { app } = buildApp({
+    otpEntregas: entregas,
+    experian: { fetchCreditReport: async () => conRastro },
+  });
+  const sesion = await hastaCredito(app, entregas);
+
+  const res = await call(app, 'POST', `/prequalify/leads/${sesion.leadId}/credit-check`, {
+    token: sesion.token, body: { ssn: '123-45-6789' },
+  });
+  assert.ok(!res.raw.includes('BANCO SECRETO'), 'se filtro contenido del reporte');
+});
+
+test('si el buro falla, al cliente le llega generico', async () => {
+  const { ProviderError } = require('../lib/prequalify/ports/errors');
+  const entregas = [];
+  const { app } = buildApp({
+    otpEntregas: entregas,
+    experian: {
+      fetchCreditReport: async () => {
+        throw new ProviderError('experian', 'reporte 403: Subscriber code not authorized');
+      },
+    },
+  });
+  const sesion = await hastaCredito(app, entregas);
+
+  const res = await call(app, 'POST', `/prequalify/leads/${sesion.leadId}/credit-check`, {
+    token: sesion.token, body: { ssn: '123-45-6789' },
+  });
+  assert.equal(res.status, 502);
+  assert.ok(!res.raw.toLowerCase().includes('subscriber'));
+  assert.ok(!res.raw.toLowerCase().includes('experian'));
 });
