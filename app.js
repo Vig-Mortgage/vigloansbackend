@@ -1,12 +1,10 @@
 const express = require('express');
 const { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand } = require('@aws-sdk/client-s3');
-const { SecretsManagerClient, GetSecretValueCommand } = require('@aws-sdk/client-secrets-manager');
 const multer = require('multer');
 const multerS3 = require('multer-s3');
 const morgan = require('morgan');
 const helmet = require('helmet');
 const cors = require('cors');
-const rateLimit = require('express-rate-limit');
 const fs = require('fs');
 const path = require('path');
 const jwt = require('jsonwebtoken');
@@ -44,72 +42,17 @@ function sanitizeFilename(filename) {
 }
 
 // -------------------- AWS SECRETS MANAGER --------------------
-const smClient = new SecretsManagerClient({
-  region: process.env.AWS_REGION || 'us-east-1',
-  credentials: {
-    accessKeyId: process.env.SM_AWS_ACCESS_KEY_ID || process.env.AWS_ACCESS_KEY_ID,
-    secretAccessKey: process.env.SM_AWS_SECRET_ACCESS_KEY || process.env.AWS_SECRET_ACCESS_KEY,
-  }
-});
+// Extraido a `lib/secrets.js` (Tarea D1). Los nombres locales se conservan
+// para no tocar los ~22 puntos de uso repartidos por este archivo.
+const {
+  getSecret,
+  getBackendSecrets,
+  getAppConfig,
+  getPrequalifySecrets,
+} = require('./lib/secrets').createSecretsProvider();
 
-// Caché de secretos con TTL de 5 minutos
-// Caché de secretos, indexada por el NOMBRE del secreto. Los buckets se crean
-// bajo demanda; no hay lista fija que haya que mantener al agregar uno nuevo.
-const secretsCache = {};
-const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutos
-
-async function getSecret(secretName) {
-  // La clave de caché ES el nombre del secreto.
-  //
-  // Antes se derivaba con un if/else que mandaba CUALQUIER nombre no
-  // reconocido al bucket 'appConfig'. Es decir: pedir un secreto nuevo
-  // devolvía en silencio el contenido de 'vigloans/app-config'. Se detectó al
-  // añadir 'vigloans/prequalify', que llegaba sin sus claves; con otro secreto
-  // podría haber devuelto credenciales que no eran las pedidas.
-  const cacheKey = secretName;
-
-  const now = Date.now();
-
-  // Retornar desde caché si aún es válido
-  if (secretsCache[cacheKey] && secretsCache[cacheKey].data && secretsCache[cacheKey].expiry > now) {
-    return secretsCache[cacheKey].data;
-  }
-
-  try {
-    const command = new GetSecretValueCommand({ SecretId: secretName });
-    const response = await smClient.send(command);
-    const parsed = JSON.parse(response.SecretString);
-
-    // Guardar en caché
-    if (!secretsCache[cacheKey]) secretsCache[cacheKey] = { data: null, expiry: 0 };
-    secretsCache[cacheKey].data = parsed;
-    secretsCache[cacheKey].expiry = now + CACHE_TTL_MS;
-
-    console.log(`Secreto '${secretName}' cargado correctamente.`);
-    return parsed;
-  } catch (error) {
-    console.error(`Error al obtener secreto '${secretName}':`, error.message);
-
-    // Si hay datos en caché expirados, usarlos como fallback
-    if (secretsCache[cacheKey] && secretsCache[cacheKey].data) {
-      console.warn(`Usando caché expirado para '${secretName}'.`);
-      return secretsCache[cacheKey].data;
-    }
-    throw error;
-  }
-}
-
-// Función helper para obtener el secreto del backend
-async function getBackendSecrets() {
-  return getSecret('vigloans/backend');
-}
-
-// Función helper para obtener la configuración de la app
-async function getAppConfig() {
-  return getSecret('vigloans/app-config');
-}
-
-// Función helper para obtener los secretos de correo SMTP2GO (Secreto 'Mail')
+// `Mail` es opcional: si no esta configurado, el envio de correo se degrada en
+// vez de tumbar el arranque. Comportamiento heredado del monolito.
 async function getMailSecrets() {
   try {
     return await getSecret('Mail');
@@ -169,25 +112,24 @@ app.get('/', (req, res) => {
   res.status(404).json({ error: 'Not Found' });
 });
 
-// -------------------- RATE LIMITER PARA AUTENTICACIÓN --------------------
-const authLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutos
-  max: 10,                   // máximo 10 intentos por IP
-  message: { error: 'Demasiados intentos de autenticación. Intente de nuevo en 15 minutos.' },
-  standardHeaders: true,
-  legacyHeaders: false,
-});
+// -------------------- CLIENTE S3 --------------------
+// Extraido a `lib/aws.js` (Tarea D1). Perezoso: no exige credenciales para
+// importar el modulo.
+const s3Client = require('./lib/aws').getS3Client();
 
-// -------------------- RATE LIMITER PARA SOPORTE/CONTACTO --------------------
-// El endpoint /support/contact es público (sin JWT), por lo que necesita
-// su propio límite para evitar abuso como relay de correo / spam.
-const supportLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutos
-  max: 5,                    // máximo 5 mensajes por IP
-  message: { error: 'Demasiados mensajes de soporte. Intente de nuevo en 15 minutos.' },
-  standardHeaders: true,
-  legacyHeaders: false,
-});
+// -------------------- AUTENTICACIÓN Y AUTORIZACIÓN --------------------
+// Extraido a `middleware/auth.js` (Tarea D2). El verificarJWT de alli fija
+// `algorithms: ['HS256']`, que aqui faltaba.
+const {
+  authorizeKeyOwnership,
+  createVerificarJWT,
+  createAuthLimiter,
+  createSupportLimiter,
+} = require('./middleware/auth');
+
+const authLimiter = createAuthLimiter();
+const supportLimiter = createSupportLimiter();
+const verificarJWT = createVerificarJWT({ getBackendSecrets });
 
 // -------------------- HELPERS DE SANITIZACIÓN DE CORREO --------------------
 // Elimina CR/LF para prevenir inyección de cabeceras SMTP (Reply-To, Subject, etc.).
@@ -396,81 +338,8 @@ app.post('/paypal/token', verificarJWT, async (req, res) => {
   }
 });
 
-// -------------------- MIDDLEWARE PARA VERIFICAR JWT --------------------
-async function verificarJWT(req, res, next) {
-  const token = req.headers['authorization']?.split(' ')[1]; // Formato: Bearer <token>
-  if (!token) {
-    return res.status(403).send({ message: "Token no proporcionado." });
-  }
-
-  try {
-    const secrets = await getBackendSecrets();
-    jwt.verify(token, secrets.jwt_secret_key, (err, decoded) => {
-      if (err) {
-        return res.status(401).send({ message: "Token inválido." });
-      }
-      req.usuario = decoded;
-      next();
-    });
-  } catch (error) {
-    console.error('Error al verificar JWT:', error.message);
-    return res.status(500).send({ message: "Error interno del servidor." });
-  }
-}
-
-// -------------------- CONFIGURACIÓN DE AWS S3 --------------------
-const s3Client = new S3Client({
-  region: process.env.AWS_REGION || 'us-east-1',
-  credentials: {
-    accessKeyId: process.env.S3_AWS_ACCESS_KEY_ID || process.env.AWS_ACCESS_KEY_ID,
-    secretAccessKey: process.env.S3_AWS_SECRET_ACCESS_KEY || process.env.AWS_SECRET_ACCESS_KEY,
-  }
-});
-
-
-
-// -------------------- FUNCIÓN PARA SANITIZAR FILENAMES --------------------
-function sanitizeFilename(filename) {
-  // Remover path traversal y caracteres peligrosos
-  return filename
-    .replace(/\.\./g, '')           // Prevenir path traversal
-    .replace(/[\/\\]/g, '_')        // Reemplazar separadores de path
-    .replace(/[^\w\s.\-()]/g, '_')  // Solo alfanuméricos, espacios, puntos, guiones, paréntesis
-    .trim();
-}
-
-// -------------------- AUTORIZACIÓN DE OBJETOS S3 (ANTI-IDOR) --------------------
-// Esquema de clave con dueño: "u{sfUserId}__{timestamp}_{random}.ext".
-// El doble guion bajo sobrevive a sanitizeFilename (solo alfanuméricos y "_").
-const OWNED_KEY_REGEX = /^u([A-Za-z0-9]+)__/;
-
-// Identificador estable del dueño a partir del JWT (solo el flujo /authenticate/sf lo trae).
-function getOwnerId(req) {
-  return (req.usuario && req.usuario.sfUserId) ? String(req.usuario.sfUserId) : null;
-}
-
-// Verifica que la clave pertenece al usuario del token.
-// - Claves con prefijo de dueño: deben coincidir con el sfUserId del token.
-// - Claves legacy (sin prefijo): se permiten temporalmente (grandfathering) y se registran,
-//   hasta migrar los objetos existentes al esquema con dueño.
-// Devuelve { ok: true } o { ok: false, status, error }.
-function authorizeKeyOwnership(req, key) {
-  const match = OWNED_KEY_REGEX.exec(key);
-  if (!match) {
-    console.warn(`[IDOR][legacy-key] Acceso a clave sin prefijo de dueño: "${key}". Pendiente de migración.`);
-    return { ok: true };
-  }
-  const owner = getOwnerId(req);
-  if (!owner) {
-    console.warn('[IDOR] Token sin sfUserId intentando acceder a clave con dueño.');
-    return { ok: false, status: 403, error: 'No autorizado para este recurso.' };
-  }
-  if (match[1] !== owner) {
-    console.warn(`[IDOR][bloqueado] Usuario ${owner} intentó acceder a clave de otro dueño: "${key}".`);
-    return { ok: false, status: 403, error: 'No autorizado para este recurso.' };
-  }
-  return { ok: true };
-}
+// verificarJWT, getOwnerId y authorizeKeyOwnership viven ahora en
+// `middleware/auth.js` (Tarea D2). Se cablean mas arriba.
 
 // -------------------- CONFIGURACIÓN DE MULTER --------------------
 // El bucket se inicializa con fallback y se actualiza al cargar secretos
