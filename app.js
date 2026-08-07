@@ -49,6 +49,8 @@ const {
   getBackendSecrets,
   getAppConfig,
   getPrequalifySecrets,
+  getTwilioSecrets,
+  getWhatsappSecrets,
 } = require('./lib/secrets').createSecretsProvider();
 
 // `Mail` es opcional: si no esta configurado, el envio de correo se degrada en
@@ -90,6 +92,19 @@ app.use(
   require('./routes/prequalifyMount').createLazyPrequalifyMount({
     getPrequalifySecrets: () => getSecret('vigloans/prequalify'),
     getBackendSecrets,
+    portImplementations: {
+      // Entrega del OTP por correo, SMS y WhatsApp. Sin esto el puerto es un
+      // stub que responde 501 y no se puede empezar ninguna precalificacion.
+      //
+      // `getMailSecrets` de este archivo devuelve `null` si el secreto `Mail`
+      // no esta: eso degrada el correo en el resto del backend, pero aqui un
+      // OTP que no llega no es una degradacion aceptable, asi que se exige.
+      otp: require('./lib/prequalify/adapters/otpDelivery').createOtpDeliveryAdapter({
+        getMailSecrets: () => getSecret('Mail'),
+        getTwilioSecrets,
+        getWhatsappSecrets,
+      }),
+    },
   })
 );
 
