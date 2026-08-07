@@ -4,6 +4,8 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 
 const {
+  MIN_AGE_YEARS,
+  ageInYears,
   phone,
   ssn,
   dateOfBirth,
@@ -75,6 +77,25 @@ test('dateOfBirth rechaza el futuro y edades imposibles', () => {
   const manana = new Date(Date.now() + 86_400_000).toISOString().slice(0, 10);
   falla(dateOfBirth, manana);
   falla(dateOfBirth, '1800-01-01');
+});
+
+test('dateOfBirth exige 21 anos: la mayoria de edad en Puerto Rico, no 18', () => {
+  const hoy = new Date();
+  const haceAnios = (n) => {
+    const d = new Date(Date.UTC(hoy.getUTCFullYear() - n, hoy.getUTCMonth(), hoy.getUTCDate()));
+    return d.toISOString().slice(0, 10);
+  };
+  assert.equal(MIN_AGE_YEARS, 21);
+  assert.equal(ok(dateOfBirth, haceAnios(21)).success, true, 'justo 21 debe pasar');
+  assert.equal(ok(dateOfBirth, haceAnios(30)).success, true);
+  falla(dateOfBirth, haceAnios(20));
+  falla(dateOfBirth, haceAnios(18)); // mayoria de edad federal, insuficiente en PR
+});
+
+test('ageInYears no cuenta el cumpleanos que aun no llega', () => {
+  const referencia = new Date(Date.UTC(2026, 5, 14)); // 14 jun 2026
+  assert.equal(ageInYears('2005-06-15', referencia), 20); // cumple manana
+  assert.equal(ageInYears('2005-06-14', referencia), 21); // cumple hoy
 });
 
 test('stateCode normaliza a mayusculas', () => {
@@ -242,13 +263,12 @@ test('employmentSchema exige patrono, puesto y fecha ISO', () => {
 // --- ingresos -------------------------------------------------------------
 
 const INGRESO_VALIDO = {
+  grossPayPerPeriod: 1200,
   incomeFrequency: 'Biweekly',
   netPay1: 1200,
   netPay2: 1200,
   netPay3: 1150,
   netPay4: 1250,
-  monthlyIncome: 2600,
-  totalIncome: 31200,
   businessOwnerOrSelfEmployed: false,
   retiredOrPensioner: false,
   paysChildSupport: false,
@@ -266,7 +286,27 @@ test('incomeSchema valida la frecuencia contra el enum del legacy', () => {
 
 test('incomeSchema rechaza montos negativos o no numericos', () => {
   falla(incomeSchema, { ...INGRESO_VALIDO, netPay1: -100 });
-  falla(incomeSchema, { ...INGRESO_VALIDO, monthlyIncome: 'mucho' });
+  falla(incomeSchema, { ...INGRESO_VALIDO, grossPayPerPeriod: 'mucho' });
+  falla(incomeSchema, { ...INGRESO_VALIDO, grossPayPerPeriod: -1 });
+});
+
+test('incomeSchema ya no acepta el mensual calculado por el cliente', () => {
+  // El legacy guardaba `totalIncome` tal cual venia del navegador. Ahora ese
+  // campo no forma parte del contrato: lo calcula el backend.
+  const r = ok(incomeSchema, { ...INGRESO_VALIDO, totalIncome: 999999 });
+  assert.equal(r.success, true);
+  assert.equal(r.data.totalIncome, undefined);
+  assert.equal(r.data.monthlyIncome, undefined);
+});
+
+test('incomeSchema exige frecuencia salvo que sea pensionado', () => {
+  const sinFrecuencia = { ...INGRESO_VALIDO };
+  delete sinFrecuencia.incomeFrequency;
+  falla(incomeSchema, sinFrecuencia);
+  assert.equal(
+    ok(incomeSchema, { ...sinFrecuencia, retiredOrPensioner: true }).success,
+    true
+  );
 });
 
 test('incomeSchema exige el monto si declara pension alimentaria', () => {

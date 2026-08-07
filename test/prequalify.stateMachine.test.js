@@ -15,6 +15,8 @@ const {
   resumeStep,
   fromLegacyStep,
   toLegacyStep,
+  needsPreviousAddress,
+  MIN_MONTHS_AT_CURRENT_ADDRESS,
 } = require('../lib/prequalify/stateMachine');
 
 /** Lead individual, sin direcciones opcionales: el camino del legacy. */
@@ -68,6 +70,60 @@ test('las direcciones opcionales solo entran si el contexto lo pide', () => {
   assert.equal(nextStep(Step.CURRENT_ADDRESS, ambas), Step.PREVIOUS_ADDRESS);
   assert.equal(nextStep(Step.PREVIOUS_ADDRESS, ambas), Step.MAILING_ADDRESS);
   assert.equal(nextStep(Step.MAILING_ADDRESS, ambas), Step.CREDIT_CHECK);
+});
+
+// --- regla URLA: direccion anterior si <2 anos en la actual ---------------
+
+test('needsPreviousAddress se deriva del tiempo en la direccion actual', () => {
+  assert.equal(MIN_MONTHS_AT_CURRENT_ADDRESS, 24);
+  // Menos de 2 anos -> hay que pedirla.
+  assert.equal(needsPreviousAddress({ currentAddressYears: 1, currentAddressMonths: 11 }), true);
+  assert.equal(needsPreviousAddress({ currentAddressYears: 0, currentAddressMonths: 3 }), true);
+  // Justo 2 anos o mas -> no.
+  assert.equal(needsPreviousAddress({ currentAddressYears: 2, currentAddressMonths: 0 }), false);
+  assert.equal(needsPreviousAddress({ currentAddressYears: 5, currentAddressMonths: 6 }), false);
+});
+
+test('needsPreviousAddress acepta anos o meses por separado', () => {
+  assert.equal(needsPreviousAddress({ currentAddressMonths: 30 }), false);
+  assert.equal(needsPreviousAddress({ currentAddressMonths: 12 }), true);
+  assert.equal(needsPreviousAddress({ currentAddressYears: 3 }), false);
+});
+
+test('needsPreviousAddress: la bandera explicita gana sobre lo derivado', () => {
+  assert.equal(
+    needsPreviousAddress({ needsPreviousAddress: true, currentAddressYears: 10 }),
+    true
+  );
+  assert.equal(
+    needsPreviousAddress({ needsPreviousAddress: false, currentAddressYears: 0, currentAddressMonths: 1 }),
+    false
+  );
+});
+
+test('needsPreviousAddress es false si no hay dato de tiempo', () => {
+  assert.equal(needsPreviousAddress({}), false);
+  assert.equal(needsPreviousAddress(), false);
+});
+
+test('el wizard intercala la direccion anterior cuando lleva <2 anos', () => {
+  const recienMudado = { ...INDIVIDUAL, currentAddressYears: 1, currentAddressMonths: 0 };
+  assert.equal(nextStep(Step.CURRENT_ADDRESS, recienMudado), Step.PREVIOUS_ADDRESS);
+  assert.equal(nextStep(Step.PREVIOUS_ADDRESS, recienMudado), Step.CREDIT_CHECK);
+
+  const arraigado = { ...INDIVIDUAL, currentAddressYears: 8, currentAddressMonths: 0 };
+  assert.equal(nextStep(Step.CURRENT_ADDRESS, arraigado), Step.CREDIT_CHECK);
+});
+
+test('canEnter bloquea el credito si falta la direccion anterior exigida', () => {
+  const state = {
+    ...INDIVIDUAL,
+    currentAddressYears: 0,
+    currentAddressMonths: 8,
+    completedSteps: [Step.START, Step.OTP_VERIFY, Step.PERSONAL, Step.CURRENT_ADDRESS],
+  };
+  assert.equal(canEnter(Step.PREVIOUS_ADDRESS, state), true);
+  assert.equal(canEnter(Step.CREDIT_CHECK, state), false);
 });
 
 test('nextStep es idempotente en el estado terminal', () => {
