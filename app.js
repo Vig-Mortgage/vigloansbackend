@@ -130,6 +130,23 @@ app.use(express.json({ limit: '10mb' }));
 // Endpoints: POST /calculator/quote, GET /calculator/config.
 app.use('/calculator', require('./routes/calculator'));
 
+// -------------------- DATOS GEOGRÁFICOS --------------------
+// GET /geo/states, GET /geo/zip/:zip. Sustituyen a getStates.php/getCities.php
+// del legacy (este último tenía inyección SQL). Sin secretos: monta directo.
+app.use('/geo', require('./routes/geo').createGeoRouter());
+
+// -------------------- PRECUALIFICACIÓN (flujo anónimo) --------------------
+// Auth propia (OTP → token de sesión), rate-limit y CORS propios.
+// Se construye perezosamente porque necesita el secreto `vigloans/prequalify`;
+// mientras no exista responde 503 y NO afecta al resto del backend.
+app.use(
+  '/prequalify',
+  require('./routes/prequalifyMount').createLazyPrequalifyMount({
+    getPrequalifySecrets: () => getSecret('vigloans/prequalify'),
+    getBackendSecrets,
+  })
+);
+
 // -------------------- HEALTH CHECK ENDPOINT --------------------
 app.get('/health', (req, res) => {
   res.status(200).json({
