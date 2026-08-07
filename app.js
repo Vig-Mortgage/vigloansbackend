@@ -153,6 +153,38 @@ const authLimiter = rateLimit({
   legacyHeaders: false,
 });
 
+// -------------------- RATE LIMITER PARA SOPORTE/CONTACTO --------------------
+// El endpoint /support/contact es público (sin JWT), por lo que necesita
+// su propio límite para evitar abuso como relay de correo / spam.
+const supportLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutos
+  max: 5,                    // máximo 5 mensajes por IP
+  message: { error: 'Demasiados mensajes de soporte. Intente de nuevo en 15 minutos.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+// -------------------- HELPERS DE SANITIZACIÓN DE CORREO --------------------
+// Elimina CR/LF para prevenir inyección de cabeceras SMTP (Reply-To, Subject, etc.).
+function sanitizeHeaderValue(value) {
+  return String(value ?? '').replace(/[\r\n]+/g, ' ').trim();
+}
+// Escapa HTML para prevenir inyección de markup en el cuerpo del correo.
+function escapeHtml(value) {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+// Validación simple de formato de email.
+function isValidEmail(value) {
+  return typeof value === 'string' &&
+    /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value) &&
+    value.length <= 254;
+}
+
 // -------------------- ENDPOINT DE AUTENTICACIÓN --------------------
 app.post('/authenticate', authLimiter, async (req, res) => {
   try {
@@ -382,6 +414,39 @@ function sanitizeFilename(filename) {
     .trim();
 }
 
+// -------------------- AUTORIZACIÓN DE OBJETOS S3 (ANTI-IDOR) --------------------
+// Esquema de clave con dueño: "u{sfUserId}__{timestamp}_{random}.ext".
+// El doble guion bajo sobrevive a sanitizeFilename (solo alfanuméricos y "_").
+const OWNED_KEY_REGEX = /^u([A-Za-z0-9]+)__/;
+
+// Identificador estable del dueño a partir del JWT (solo el flujo /authenticate/sf lo trae).
+function getOwnerId(req) {
+  return (req.usuario && req.usuario.sfUserId) ? String(req.usuario.sfUserId) : null;
+}
+
+// Verifica que la clave pertenece al usuario del token.
+// - Claves con prefijo de dueño: deben coincidir con el sfUserId del token.
+// - Claves legacy (sin prefijo): se permiten temporalmente (grandfathering) y se registran,
+//   hasta migrar los objetos existentes al esquema con dueño.
+// Devuelve { ok: true } o { ok: false, status, error }.
+function authorizeKeyOwnership(req, key) {
+  const match = OWNED_KEY_REGEX.exec(key);
+  if (!match) {
+    console.warn(`[IDOR][legacy-key] Acceso a clave sin prefijo de dueño: "${key}". Pendiente de migración.`);
+    return { ok: true };
+  }
+  const owner = getOwnerId(req);
+  if (!owner) {
+    console.warn('[IDOR] Token sin sfUserId intentando acceder a clave con dueño.');
+    return { ok: false, status: 403, error: 'No autorizado para este recurso.' };
+  }
+  if (match[1] !== owner) {
+    console.warn(`[IDOR][bloqueado] Usuario ${owner} intentó acceder a clave de otro dueño: "${key}".`);
+    return { ok: false, status: 403, error: 'No autorizado para este recurso.' };
+  }
+  return { ok: true };
+}
+
 // -------------------- CONFIGURACIÓN DE MULTER --------------------
 // El bucket se inicializa con fallback y se actualiza al cargar secretos
 let uploadBucketName = 'vigpr-sf-prod';
@@ -429,6 +494,12 @@ app.get('/downloadFile/:key', verificarJWT, async (req, res) => {
       return res.status(400).json({ error: 'Nombre de archivo inválido.' });
     }
 
+    // ANTI-IDOR: validar que la clave pertenece al usuario autenticado.
+    const authz = authorizeKeyOwnership(req, key);
+    if (!authz.ok) {
+      return res.status(authz.status).json({ error: authz.error });
+    }
+
     const getParams = {
       Bucket: uploadBucketName,
       Key: key,
@@ -456,6 +527,12 @@ app.delete('/deleteFile/:key', verificarJWT, async (req, res) => {
     const key = sanitizeFilename(req.params.key);
     if (!key) {
       return res.status(400).json({ error: 'Nombre de archivo inválido.' });
+    }
+
+    // ANTI-IDOR: validar que la clave pertenece al usuario autenticado.
+    const authz = authorizeKeyOwnership(req, key);
+    if (!authz.ok) {
+      return res.status(authz.status).json({ error: authz.error });
     }
 
     const deleteParams = {
@@ -791,7 +868,14 @@ app.post('/mergePDFs', verificarJWT, async (req, res) => {
 
     for (const [index, url] of validUrls.entries()) {
       console.log(`Procesando URL ${index + 1}: ${url}`);
-      const key = extractKeyFromUrl(url);
+      const key = sanitizeFilename(extractKeyFromUrl(url));
+
+      // ANTI-IDOR: cada clave debe pertenecer al usuario autenticado.
+      const authz = authorizeKeyOwnership(req, key);
+      if (!authz.ok) {
+        return res.status(authz.status).json({ error: authz.error });
+      }
+
       const getParams = { Bucket: bucketName, Key: key };
       try {
         const command = new GetObjectCommand(getParams);
@@ -850,7 +934,7 @@ app.post('/mergePDFs', verificarJWT, async (req, res) => {
 
 // -------------------- ENDPOINT DE CONTACTO DE SOPORTE --------------------
 // Envía un correo con los datos del formulario a info@vigmortgage.com
-app.post('/support/contact', async (req, res) => {
+app.post('/support/contact', supportLimiter, async (req, res) => {
   try {
     const { name, email, subject, message } = req.body;
 
@@ -858,7 +942,28 @@ app.post('/support/contact', async (req, res) => {
       return res.status(400).json({ error: 'Todos los campos son requeridos (name, email, subject, message).' });
     }
 
-    console.log(`[SOPORTE] Recibido mensaje de ${name} (${email}): Asunto: ${subject}`);
+    // Validar tipos y longitudes para evitar payloads abusivos.
+    if (typeof name !== 'string' || typeof subject !== 'string' || typeof message !== 'string') {
+      return res.status(400).json({ error: 'Formato de campos inválido.' });
+    }
+    if (!isValidEmail(email)) {
+      return res.status(400).json({ error: 'El correo de contacto no es válido.' });
+    }
+    if (name.length > 120 || subject.length > 200 || message.length > 5000) {
+      return res.status(400).json({ error: 'Uno o más campos exceden la longitud permitida.' });
+    }
+
+    // Sanitizar: valores que van a CABECERAS SMTP no pueden contener CR/LF;
+    // valores que van al cuerpo HTML se escapan para evitar inyección de markup.
+    const safeName = sanitizeHeaderValue(name);
+    const safeSubject = sanitizeHeaderValue(subject);
+    const safeEmail = sanitizeHeaderValue(email);
+    const htmlName = escapeHtml(safeName);
+    const htmlEmail = escapeHtml(safeEmail);
+    const htmlSubject = escapeHtml(safeSubject);
+    const htmlMessage = escapeHtml(message);
+
+    console.log(`[SOPORTE] Recibido mensaje de ${safeName} (${safeEmail}): Asunto: ${safeSubject}`);
 
     // Para enviar el correo, usaremos el cliente SMTP nativo con las credenciales del secreto 'Mail'
     const mailSecrets = await getMailSecrets();
@@ -871,9 +976,9 @@ app.post('/support/contact', async (req, res) => {
       console.warn('⚠️ Credenciales del secreto Mail no encontradas. Simulando el envío del correo en consola.');
       console.log('--- EMAIL SIMULADO ---');
       console.log(`Para: info@vigmortgage.com`);
-      console.log(`De: ${name} <${email}>`);
-      console.log(`Asunto: [Soporte App] ${subject}`);
-      console.log(`Mensaje:\n${message}`);
+      console.log(`De: ${safeName} <${safeEmail}>`);
+      console.log(`Asunto: [Soporte App] ${safeSubject}`);
+      console.log('Mensaje: [omitido del log]');
       console.log('----------------------');
 
       return res.json({ message: 'Mensaje de soporte enviado exitosamente (Simulado).' });
@@ -884,14 +989,14 @@ app.post('/support/contact', async (req, res) => {
       <h2 style="color: #0A6FAF; margin-top: 0;">Nuevo Mensaje de Soporte</h2>
       <p style="color: #666; font-size: 14px;">Recibido desde la aplicación móvil VIG Loans</p>
       <hr style="border: 0; border-top: 1px solid #eee; margin: 15px 0;" />
-      <p style="margin: 8px 0;"><strong>Nombre:</strong> ${name}</p>
-      <p style="margin: 8px 0;"><strong>Correo de contacto:</strong> <a href="mailto:${email}" style="color: #0A6FAF;">${email}</a></p>
-      <p style="margin: 8px 0;"><strong>Asunto:</strong> ${subject}</p>
+      <p style="margin: 8px 0;"><strong>Nombre:</strong> ${htmlName}</p>
+      <p style="margin: 8px 0;"><strong>Correo de contacto:</strong> <a href="mailto:${htmlEmail}" style="color: #0A6FAF;">${htmlEmail}</a></p>
+      <p style="margin: 8px 0;"><strong>Asunto:</strong> ${htmlSubject}</p>
       <div style="background-color: #f8fafc; padding: 15px; border-left: 4px solid #0A6FAF; border-radius: 4px; margin-top: 15px;">
-        <p style="white-space: pre-wrap; margin: 0; font-size: 14px; line-height: 1.5;">${message}</p>
+        <p style="white-space: pre-wrap; margin: 0; font-size: 14px; line-height: 1.5;">${htmlMessage}</p>
       </div>
       <hr style="border: 0; border-top: 1px solid #eee; margin: 20px 0 10px 0;" />
-      <p style="font-size: 12px; color: #999; text-align: center; margin: 0;">Puedes responder a este correo para comunicarte directamente con ${name}.</p>
+      <p style="font-size: 12px; color: #999; text-align: center; margin: 0;">Puedes responder a este correo para comunicarte directamente con ${htmlName}.</p>
     </div>`;
 
     // Envío usando protocolo SMTP nativo (mail.smtp2go.com)
@@ -902,8 +1007,8 @@ app.post('/support/contact', async (req, res) => {
       password: smtpPass,
       from: 'info@vigmortgage.com',
       to: 'info@vigmortgage.com',
-      replyTo: `${name} <${email}>`,
-      subject: `[Soporte App] ${subject}`,
+      replyTo: `${safeName} <${safeEmail}>`,
+      subject: `[Soporte App] ${safeSubject}`,
       htmlBody: htmlTemplate,
     });
 
