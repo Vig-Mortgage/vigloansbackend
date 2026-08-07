@@ -53,17 +53,20 @@ const smClient = new SecretsManagerClient({
 });
 
 // Caché de secretos con TTL de 5 minutos
-const secretsCache = {
-  backend: { data: null, expiry: 0 },
-  appConfig: { data: null, expiry: 0 },
-  mail: { data: null, expiry: 0 },
-};
+// Caché de secretos, indexada por el NOMBRE del secreto. Los buckets se crean
+// bajo demanda; no hay lista fija que haya que mantener al agregar uno nuevo.
+const secretsCache = {};
 const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutos
 
 async function getSecret(secretName) {
-  let cacheKey = 'appConfig';
-  if (secretName === 'vigloans/backend') cacheKey = 'backend';
-  else if (secretName === 'Mail' || secretName === 'mail') cacheKey = 'mail';
+  // La clave de caché ES el nombre del secreto.
+  //
+  // Antes se derivaba con un if/else que mandaba CUALQUIER nombre no
+  // reconocido al bucket 'appConfig'. Es decir: pedir un secreto nuevo
+  // devolvía en silencio el contenido de 'vigloans/app-config'. Se detectó al
+  // añadir 'vigloans/prequalify', que llegaba sin sus claves; con otro secreto
+  // podría haber devuelto credenciales que no eran las pedidas.
+  const cacheKey = secretName;
 
   const now = Date.now();
 
