@@ -42,6 +42,16 @@ function buildCors() {
     .filter(Boolean);
 
   return cors({
+    // El CORS global de `app.js` ya escribio `Access-Control-Allow-Origin: *`
+    // antes de llegar aqui. Cuando este `cors()` decide NO permitir un origen
+    // simplemente no escribe cabecera, asi que la permisiva del global
+    // sobrevivia y esta restriccion era un no-op: cualquier sitio podia llamar
+    // al flujo anonimo desde un navegador. Se detecto probando el wizard en
+    // local contra el backend desplegado.
+    //
+    // Por eso se limpian primero las cabeceras de arriba: lo que decida este
+    // router es lo que vale.
+    preflightContinue: false,
     origin(origin, callback) {
       // Sin `Origin` = app movil o server-to-server: se permite.
       if (!origin) return callback(null, true);
@@ -67,6 +77,14 @@ function createLazyPrequalifyMount({
   portImplementations = {},
 } = {}) {
   const mount = express.Router();
+
+  // Borra lo que el CORS global de `app.js` haya escrito, para que la politica
+  // de este router sea la que mande. Ver la nota en [buildCors].
+  mount.use((req, res, next) => {
+    res.removeHeader('Access-Control-Allow-Origin');
+    res.removeHeader('Access-Control-Allow-Credentials');
+    next();
+  });
   mount.use(buildCors());
 
   let real = null;

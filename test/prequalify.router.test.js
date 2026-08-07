@@ -543,3 +543,79 @@ test('submit tambien respeta la autorizacion por recurso', async () => {
   });
   assert.equal(res.status, 404);
 });
+
+// --- CORS propio del flujo anonimo ---------------------------------------
+
+test('el CORS del flujo anonimo GANA al CORS global permisivo', async () => {
+  // El global de app.js escribe `Access-Control-Allow-Origin: *`. Si este
+  // router se limita a "no escribir nada" cuando el origen no esta permitido,
+  // la cabecera permisiva sobrevive y la restriccion no sirve de nada. Se
+  // detecto probando el wizard en local contra el backend desplegado.
+  const { createLazyPrequalifyMount } = require('../routes/prequalifyMount');
+  const app = express();
+  app.use(express.json());
+  // Simula el CORS global permisivo que corre antes.
+  app.use((req, res, next) => {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+    next();
+  });
+  app.use('/prequalify', createLazyPrequalifyMount({
+    getPrequalifySecrets: async () => ({
+      session_secret: SESSION_SECRET, otp_secret: OTP_SECRET,
+    }),
+  }));
+  app.use(notFoundHandler);
+  app.use(errorHandler);
+
+  const srv = app.listen(0);
+  const { port } = srv.address();
+  try {
+    const ajeno = await fetch(`http://127.0.0.1:${port}/prequalify/leads`, {
+      headers: { Origin: 'https://sitio-cualquiera.example' },
+    });
+    assert.equal(
+      ajeno.headers.get('access-control-allow-origin'),
+      null,
+      'un origen no permitido no debe recibir ACAO'
+    );
+    assert.equal(ajeno.headers.get('access-control-allow-credentials'), null);
+  } finally {
+    srv.close();
+  }
+});
+
+test('un origen permitido si recibe su ACAO, y nunca `*`', async () => {
+  const previo = process.env.PREQUALIFY_CORS_ORIGINS;
+  process.env.PREQUALIFY_CORS_ORIGINS = 'https://www.vigpr.com';
+  try {
+    const { createLazyPrequalifyMount } = require('../routes/prequalifyMount');
+    const app = express();
+    app.use(express.json());
+    app.use((req, res, next) => {
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      next();
+    });
+    app.use('/prequalify', createLazyPrequalifyMount({
+      getPrequalifySecrets: async () => ({
+        session_secret: SESSION_SECRET, otp_secret: OTP_SECRET,
+      }),
+    }));
+    app.use(notFoundHandler);
+    app.use(errorHandler);
+
+    const srv = app.listen(0);
+    const { port } = srv.address();
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/prequalify/leads`, {
+        headers: { Origin: 'https://www.vigpr.com' },
+      });
+      assert.equal(res.headers.get('access-control-allow-origin'), 'https://www.vigpr.com');
+    } finally {
+      srv.close();
+    }
+  } finally {
+    if (previo === undefined) delete process.env.PREQUALIFY_CORS_ORIGINS;
+    else process.env.PREQUALIFY_CORS_ORIGINS = previo;
+  }
+});
