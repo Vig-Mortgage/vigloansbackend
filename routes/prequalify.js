@@ -159,12 +159,17 @@ function createPrequalifyRouter({ ports, otpService, sessions } = {}) {
   /** Aplica un paso: persiste, marca completado y devuelve el siguiente. */
   async function applyStep(req, res, step, fields) {
     const leadId = req.prequal.leadId;
-    await ports.salesforce.updateLead(leadId, fields);
+    const completedSteps = [...new Set([...(req.lead.completedSteps ?? []), step])];
 
-    const contexto = {
-      ...req.lead,
-      completedSteps: [...new Set([...(req.lead.completedSteps ?? []), step])],
-    };
+    // `completedSteps` viaja con los datos del paso. Sin esto la marca vive solo
+    // en memoria del request y el lead nunca avanza: al volver, `resumeStep`
+    // devolveria siempre el mismo paso.
+    // TODO(Roberto): hace falta un campo en el Lead donde persistirlo. El
+    // `currentStep__c` legacy es un solo numero y no distingue "hice el paso 3
+    // pero me falta el 2", que si puede pasar con los pasos opcionales.
+    await ports.salesforce.updateLead(leadId, { ...fields, completedSteps });
+
+    const contexto = { ...req.lead, completedSteps };
     const siguiente = nextStep(step, contexto);
     const legacy = toLegacyStep(siguiente);
     if (legacy !== null) await ports.salesforce.setCurrentStep(leadId, legacy);
@@ -241,6 +246,13 @@ function createPrequalifyRouter({ ports, otpService, sessions } = {}) {
       const existente = await ports.salesforce.findLeadByEmailOrPhone({ email, phone });
       const lead = existente ?? (await ports.salesforce.createLead({ email, phone }));
 
+      // El paso `otpVerify` se marca aqui: es el unico sitio donde se verifica.
+      // Sin esto ningun paso posterior seria entrable.
+      const previos = (await ports.salesforce.getLead(lead.id))?.completedSteps ?? [];
+      await ports.salesforce.updateLead(lead.id, {
+        completedSteps: [...new Set([...previos, Step.OTP_VERIFY])],
+      });
+
       const { token, expiresInSeconds } = sessions.issue({ leadId: lead.id });
       logger.info('prequalify.sesion_emitida', { nuevo: !existente });
 
@@ -283,6 +295,26 @@ function createPrequalifyRouter({ ports, otpService, sessions } = {}) {
     );
   }
 
+  /**
+   * `start`: persiste la identidad recogida antes del OTP.
+   *
+   * El lead nace en `/otp/verify` (que es donde hay algo que autorizar), pero
+   * ahi solo se guardan email y telefono. Nombre, apellido, fecha de nacimiento
+   * y proposito se recogen en la primera pantalla y se persisten aqui, ya con
+   * sesion. Sin este endpoint el paso `start` no se completa nunca y
+   * `resumeStep` se queda clavado — era un hueco real del contrato.
+   *
+   * El orden en que se completan `start` y `otpVerify` no importa: `canEnter`
+   * comprueba pertenencia al conjunto de completados, no secuencia.
+   */
+  router.post(
+    '/leads',
+    requireSession,
+    validate(schemas.startSchema),
+    requireStep(Step.START),
+    asyncHandler((req, res) => applyStep(req, res, Step.START, req.validated.body))
+  );
+
   stepRoute('patch', '/leads/:id/personal', Step.PERSONAL, schemas.personalSchema);
   stepRoute('put', '/leads/:id/addresses', Step.CURRENT_ADDRESS, schemas.currentAddressSchema);
   stepRoute(
@@ -314,6 +346,22 @@ function createPrequalifyRouter({ ports, otpService, sessions } = {}) {
       // Sin proveedor configurado no se llega aqui: el puerto lanza 501.
       res.status(501).json({ error: 'Este servicio no esta disponible en este momento.' });
     })
+  );
+
+  /**
+   * `submit`: cierra la solicitud.
+   *
+   * No recibe datos: todo se envio en los pasos anteriores. Solo marca el paso
+   * y deja el lead listo para que lo tome un asesor. La decision de credito NO
+   * se emite aqui — ver `lib/prequalify/policy.js`.
+   */
+  router.post(
+    '/leads/:id/submit',
+    requireSession,
+    validate(LeadIdParams, 'params'),
+    authorizeLead,
+    requireStep(Step.SUBMIT),
+    asyncHandler((req, res) => applyStep(req, res, Step.SUBMIT, {}))
   );
 
   return router;

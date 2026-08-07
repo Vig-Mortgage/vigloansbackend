@@ -25,14 +25,19 @@ function fakeSalesforce(inicial = {}) {
       [...leads.values()].find((l) => l.email === email) ?? null,
     createLead: async (data) => {
       seq += 1;
-      const lead = { id: `00Q${seq}`, completedSteps: [Step.START, Step.OTP_VERIFY], ...data, ...inicial };
+      // NO se pre-marca ningun paso: el fixture anterior ponia [START, OTP_VERIFY]
+      // y eso oculto que el router no tenia endpoint para completarlos.
+      const lead = { id: `00Q${seq}`, completedSteps: [], ...data, ...inicial };
       leads.set(lead.id, lead);
       return { id: lead.id };
     },
     getLead: async (id) => leads.get(id) ?? null,
     updateLead: async (id, fields) => {
       const lead = leads.get(id);
-      if (lead) Object.assign(lead, { campos: { ...(lead.campos ?? {}), ...fields } });
+      if (!lead) return;
+      const { completedSteps, ...resto } = fields;
+      if (completedSteps) lead.completedSteps = completedSteps;
+      Object.assign(lead, { campos: { ...(lead.campos ?? {}), ...resto } });
     },
     setCurrentStep: async () => {},
   };
@@ -86,12 +91,31 @@ async function call(app, method, path, { body, token } = {}) {
   }
 }
 
-/** Recorre OTP -> verify y devuelve la sesion. */
+const IDENTIDAD = {
+  email: 'juan@example.com',
+  phone: '7871234567',
+  firstName: 'Juan',
+  lastName: 'Del Valle',
+  dob: '1985-06-15',
+  loanPurpose: 'Compra',
+};
+
+/** Recorre OTP -> verify y devuelve la sesion (sin completar `start`). */
 async function autenticar(app, entregas, email = 'juan@example.com') {
   await call(app, 'POST', '/prequalify/otp', { body: { channel: 'email', email } });
   const code = entregas.at(-1).code;
   const res = await call(app, 'POST', '/prequalify/otp/verify', { body: { code, email } });
   return res.body;
+}
+
+/** Autentica y ademas completa `start`, que es el punto de partida real. */
+async function arrancar(app, entregas, email = 'juan@example.com') {
+  const sesion = await autenticar(app, entregas, email);
+  await call(app, 'POST', '/prequalify/leads', {
+    token: sesion.token,
+    body: { ...IDENTIDAD, email },
+  });
+  return sesion;
 }
 
 // --- OTP ------------------------------------------------------------------
@@ -221,7 +245,7 @@ test('IDOR: la sesion de un lead no puede tocar el lead de otro', async () => {
 test('GET /leads devuelve el paso donde reanudar', async () => {
   const entregas = [];
   const { app } = buildApp({ otpEntregas: entregas });
-  const sesion = await autenticar(app, entregas);
+  const sesion = await arrancar(app, entregas);
 
   const res = await call(app, 'GET', '/prequalify/leads', { token: sesion.token });
   assert.equal(res.status, 200);
@@ -234,7 +258,7 @@ test('GET /leads devuelve el paso donde reanudar', async () => {
 test('no se puede saltar un paso: empleo antes de datos personales da 409', async () => {
   const entregas = [];
   const { app } = buildApp({ otpEntregas: entregas });
-  const sesion = await autenticar(app, entregas);
+  const sesion = await arrancar(app, entregas);
 
   const res = await call(app, 'PUT', `/prequalify/leads/${sesion.leadId}/employment`, {
     token: sesion.token,
@@ -260,7 +284,7 @@ test('no se puede saltar un paso: empleo antes de datos personales da 409', asyn
 test('el paso valido avanza y anuncia el siguiente', async () => {
   const entregas = [];
   const { app } = buildApp({ otpEntregas: entregas });
-  const sesion = await autenticar(app, entregas);
+  const sesion = await arrancar(app, entregas);
 
   const res = await call(app, 'PATCH', `/prequalify/leads/${sesion.leadId}/personal`, {
     token: sesion.token,
@@ -438,4 +462,84 @@ test('con los secretos correctos el montaje sirve el router', async () => {
 
   // Sin token: 401 (el router respondió, no el 503 del montaje).
   assert.equal((await call(app, 'GET', '/prequalify/leads')).status, 401);
+});
+
+
+// --- pasos start y submit (huecos que encontro el cliente Flutter) --------
+
+test('POST /leads completa `start`: sin el, personal da 409', async () => {
+  const entregas = [];
+  const { app } = buildApp({ otpEntregas: entregas });
+  const sesion = await autenticar(app, entregas);
+
+  const cuerpoPersonal = {
+    dob: '1985-06-15', ssn: '123-45-6789', citizenship: 'U.S. Citizen',
+    maritalStatus: 'Single', dependents: 0, typeOfCredit: 'IndividualCredit',
+  };
+
+  // Sin `start` no se puede entrar a personal.
+  const bloqueado = await call(app, 'PATCH', `/prequalify/leads/${sesion.leadId}/personal`, {
+    token: sesion.token, body: cuerpoPersonal,
+  });
+  assert.equal(bloqueado.status, 409);
+  assert.equal(bloqueado.body.expectedStep, Step.START);
+
+  // Con `start` completado, si.
+  const inicio = await call(app, 'POST', '/prequalify/leads', {
+    token: sesion.token, body: IDENTIDAD,
+  });
+  assert.equal(inicio.status, 200);
+  assert.equal(inicio.body.step, Step.START);
+
+  const ok = await call(app, 'PATCH', `/prequalify/leads/${sesion.leadId}/personal`, {
+    token: sesion.token, body: cuerpoPersonal,
+  });
+  assert.equal(ok.status, 200);
+});
+
+test('el progreso PERSISTE entre requests', async () => {
+  // Antes `completedSteps` solo vivia en memoria del request: el lead nunca
+  // avanzaba y resumeStep devolvia siempre lo mismo.
+  const entregas = [];
+  const { app } = buildApp({ otpEntregas: entregas });
+  const sesion = await arrancar(app, entregas);
+
+  const antes = await call(app, 'GET', '/prequalify/leads', { token: sesion.token });
+  assert.equal(antes.body.currentStep, Step.PERSONAL);
+
+  await call(app, 'PATCH', `/prequalify/leads/${sesion.leadId}/personal`, {
+    token: sesion.token,
+    body: {
+      dob: '1985-06-15', ssn: '123-45-6789', citizenship: 'U.S. Citizen',
+      maritalStatus: 'Single', dependents: 0, typeOfCredit: 'IndividualCredit',
+    },
+  });
+
+  const despues = await call(app, 'GET', '/prequalify/leads', { token: sesion.token });
+  assert.equal(despues.body.currentStep, Step.CURRENT_ADDRESS, 'debe haber avanzado');
+});
+
+test('POST /leads/:id/submit existe y respeta la maquina de estados', async () => {
+  const entregas = [];
+  const { app } = buildApp({ otpEntregas: entregas });
+  const sesion = await arrancar(app, entregas);
+
+  // Todavia faltan pasos: no se puede enviar.
+  const temprano = await call(app, 'POST', `/prequalify/leads/${sesion.leadId}/submit`, {
+    token: sesion.token,
+  });
+  assert.equal(temprano.status, 409);
+  assert.notEqual(temprano.status, 404, 'la ruta debe existir');
+});
+
+test('submit tambien respeta la autorizacion por recurso', async () => {
+  const entregas = [];
+  const { app } = buildApp({ otpEntregas: entregas });
+  const juan = await arrancar(app, entregas, 'juan@example.com');
+  const ana = await arrancar(app, entregas, 'ana@example.com');
+
+  const res = await call(app, 'POST', `/prequalify/leads/${ana.leadId}/submit`, {
+    token: juan.token,
+  });
+  assert.equal(res.status, 404);
 });
