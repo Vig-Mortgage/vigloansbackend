@@ -1,9 +1,12 @@
 /**
  * Test E2E para vigloansbackend en local
- * Ejecutar: node test-local.mjs
+ * Ejecutar: node scripts/e2e-local.mjs   (destino: BASE_URL, por defecto http://localhost:8080)
  */
 
-const BASE_URL = 'http://localhost:8080';
+// Destino configurable: por defecto el backend local, pero permite apuntar a
+// v2 (http://localhost:8081) o a https://vigloans-v2.vigappdocs.com sin editar
+// el archivo. OJO: el 8080 es el backend viejo de PRODUCCION.
+const BASE_URL = process.env.BASE_URL || 'http://localhost:8080';
 let jwtToken = null;
 
 // -------------------- UTILIDADES --------------------
@@ -199,7 +202,7 @@ async function testAuthenticate() {
   if (!authenticated) {
     logSkip('POST /authenticate (válido)', 'No se encontraron credenciales válidas. Los tests protegidos serán saltados.');
     log('💡', `Para completar los tests, establece las variables AUTH_USER y AUTH_PASS:`);
-    log('💡', `  AUTH_USER=xxx AUTH_PASS=xxx node test-local.mjs`);
+    log('💡', `  AUTH_USER=xxx AUTH_PASS=xxx node scripts/e2e-local.mjs`);
 
     // Intentar con variables de entorno
     const envUser = process.env.AUTH_USER;

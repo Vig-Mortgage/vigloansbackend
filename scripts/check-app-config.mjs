@@ -1,5 +1,5 @@
 // Script para verificar los campos del secreto vigloans/app-config
-// Ejecutar con: node test-app-config.mjs
+// Ejecutar con: node scripts/check-app-config.mjs
 
 import { SecretsManagerClient, GetSecretValueCommand } from '@aws-sdk/client-secrets-manager';
 import { config } from 'dotenv';

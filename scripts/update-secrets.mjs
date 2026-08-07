@@ -1,6 +1,6 @@
 // Script para agregar los secretos faltantes a vigloans/app-config
 // Los valores se toman de los hardcoded que estamos eliminando de la app.
-// Ejecutar con: node update-secrets.mjs
+// Ejecutar con: node scripts/update-secrets.mjs
 
 import { SecretsManagerClient, GetSecretValueCommand, PutSecretValueCommand } from '@aws-sdk/client-secrets-manager';
 import { config } from 'dotenv';
