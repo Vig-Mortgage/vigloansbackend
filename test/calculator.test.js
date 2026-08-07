@@ -27,8 +27,9 @@ test('FHA purchase 200k @ 3.5% down, 30yr, 6.5% — paridad de piezas exactas', 
   assert.strictEqual(q.upfrontFee, 3378);            // round(193000*0.0175)
   assert.ok(approx(q.totalLoanAmount, 196378), `total=${q.totalLoanAmount}`);
   assert.ok(approx(q.minDownPayment, 7000), `minDp=${q.minDownPayment}`); // 200000*0.035
-  // MIP: base=price-ufmip=196622, rate 0.55 (ltv>95), mensual = 196622*0.0055/12
-  assert.ok(approx(q.monthlyMIP, 90.1184, 0.001), `monthlyMIP=${q.monthlyMIP}`);
+  // MIP: base = Base Loan Amount = 193000 (ANTES de financiar el UFMIP, por
+  // definición de HUD), rate 0.55 (ltv>95) => 193000*0.0055/12
+  assert.ok(approx(q.monthlyMIP, (193000 * 0.0055) / 12, 0.001), `monthlyMIP=${q.monthlyMIP}`);
   // P&I sobre 196378 @ 6.5% 30yr ≈ 1241.2
   assert.ok(approx(q.monthlyPrincipalAndInterest, 1241.2, 0.5), `pi=${q.monthlyPrincipalAndInterest}`);
   // total = pi + mip (taxes/ins/hoa = 0)
@@ -64,8 +65,10 @@ test('CONV con 10% down y FICO 720-739 lleva PMI', () => {
     creditScore: '720-739',
     taxes: 0, insurance: 0, hoa: 0,
   });
-  // PMI rate 30yr/720-739/10-15 = 0.75 → mensual = 300000*0.0075/12 = 187.5
-  assert.ok(approx(q.monthlyMIP, 187.5, 0.001), `pmi=${q.monthlyMIP}`);
+  // PMI rate 30yr/720-739/10-15 = 0.75. La base es el préstamo (270000), NO el
+  // valor de la propiedad => 270000*0.0075/12 = 168.75
+  assert.strictEqual(q.loanBase, 270000);
+  assert.ok(approx(q.monthlyMIP, (270000 * 0.0075) / 12, 0.001), `pmi=${q.monthlyMIP}`);
 });
 
 test('VA purchase exento de funding fee → upfront 0', () => {
@@ -102,13 +105,27 @@ test('VA purchase first-time, 0% down → funding fee 2.15%', () => {
   assert.ok(approx(q.upfrontFee, 250000 * 0.0215, 0.001), `ff=${q.upfrontFee}`);
 });
 
-test('USDA aplica fee anual 0.35% mensualizado', () => {
+test('USDA: guarantee fee upfront 1% financiado + annual fee 0.35% mensualizado', () => {
   const q = computeQuote({
     transactionType: 'purchase', loanType: 'USDA', price: 200000, years: 30, interest: 6.5,
     downPaymentMode: 'percent', downPaymentValue: 0, taxes: 0, insurance: 0, hoa: 0,
   });
-  // (200000*0.35/100)/12 = 58.333...
-  assert.ok(approx(q.monthlyMIP, (200000 * 0.35 / 100) / 12, 0.001), `usda=${q.monthlyMIP}`);
+  assert.strictEqual(q.loanBase, 200000);
+  assert.strictEqual(q.upfrontFee, 2000);                  // round(200000*0.01)
+  assert.strictEqual(q.totalLoanAmount, 202000);           // el fee se financia
+  // El annual fee va sobre el balance de principal, que INCLUYE el fee financiado.
+  assert.ok(approx(q.monthlyMIP, (202000 * 0.0035) / 12, 0.001), `usda=${q.monthlyMIP}`);
+});
+
+test('USDA: el upfront NO es exentable (la exención es solo de VA)', () => {
+  const base = {
+    transactionType: 'purchase', loanType: 'USDA', price: 200000, years: 30, interest: 6.5,
+    downPaymentMode: 'percent', downPaymentValue: 0, taxes: 0, insurance: 0, hoa: 0,
+  };
+  const normal = computeQuote(base);
+  const conExencion = computeQuote({ ...base, isVaFundingFeeExempt: true });
+  assert.strictEqual(conExencion.upfrontFee, normal.upfrontFee);
+  assert.strictEqual(conExencion.totalMonthlyPayment, normal.totalMonthlyPayment);
 });
 
 test('seguro por defecto = price*0.00022 redondeado cuando no se envía', () => {
