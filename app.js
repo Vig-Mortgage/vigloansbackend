@@ -117,6 +117,9 @@ app.get('/', (req, res) => {
 // importar el modulo.
 const s3Client = require('./lib/aws').getS3Client();
 
+// Correo: nodemailer con TLS verificado (Tarea D3).
+const { createMailer } = require('./lib/mailer');
+
 // -------------------- AUTENTICACIÓN Y AUTORIZACIÓN --------------------
 // Extraido a `middleware/auth.js` (Tarea D2). El verificarJWT de alli fija
 // `algorithms: ['HS256']`, que aqui faltaba.
@@ -893,20 +896,22 @@ app.post('/support/contact', supportLimiter, async (req, res) => {
       <p style="font-size: 12px; color: #999; text-align: center; margin: 0;">Puedes responder a este correo para comunicarte directamente con ${htmlName}.</p>
     </div>`;
 
-    // Envío usando protocolo SMTP nativo (mail.smtp2go.com)
-    await sendSmtpEmail({
-      host: smtpHost,
-      port: 2525, // Usamos puerto SMTP alternativo de SMTP2GO seguro
-      username: smtpUser,
-      password: smtpPass,
+    // Envío por SMTP2GO con `lib/mailer.js` (nodemailer, TLS verificado).
+    //
+    // Se respeta el secreto `Mail` TAL CUAL: MAIL_PORT=443 y
+    // MAIL_ENCRYPTION=ssl. El cliente casero anterior ignoraba ambos y clavaba
+    // el puerto 2525, que no negocia TLS: la contraseña de SMTP2GO viajaba
+    // legible en cada mensaje de soporte.
+    const mailer = createMailer({ credentials: mailSecrets });
+    await mailer.sendMail({
       from: 'info@vigmortgage.com',
       to: 'info@vigmortgage.com',
-      replyTo: `${safeName} <${safeEmail}>`,
+      replyTo: safeEmail,
       subject: `[Soporte App] ${safeSubject}`,
-      htmlBody: htmlTemplate,
+      html: htmlTemplate,
     });
 
-    console.log('✅ Correo de soporte enviado exitosamente vía SMTP2GO (SMTP Nativo).');
+    console.log('✅ Correo de soporte enviado exitosamente vía SMTP2GO.');
     return res.json({ message: 'Mensaje de soporte enviado exitosamente.' });
 
   } catch (error) {
@@ -915,78 +920,9 @@ app.post('/support/contact', supportLimiter, async (req, res) => {
   }
 });
 
-// -------------------- HELPER CLIENTE SMTP NATIVO --------------------
-function sendSmtpEmail({ host, port, username, password, from, to, replyTo, subject, htmlBody }) {
-  return new Promise((resolve, reject) => {
-    const net = require('net');
-    const tls = require('tls');
-
-    const targetPort = parseInt(port || '2525', 10);
-    const targetHost = host || 'mail.smtp2go.com';
-    const isDirectTls = targetPort === 465;
-
-    let client;
-    let step = 0;
-
-    const handleData = (data) => {
-      const response = data.toString();
-
-      if (step === 0 && response.startsWith('220')) {
-        step = 1;
-        client.write('EHLO localhost\r\n');
-      } else if (step === 1 && response.startsWith('250')) {
-        step = 2;
-        client.write('AUTH LOGIN\r\n');
-      } else if (step === 2 && response.startsWith('334')) {
-        step = 3;
-        client.write(Buffer.from(username).toString('base64') + '\r\n');
-      } else if (step === 3 && response.startsWith('334')) {
-        step = 4;
-        client.write(Buffer.from(password).toString('base64') + '\r\n');
-      } else if (step === 4 && response.startsWith('235')) {
-        step = 5;
-        client.write(`MAIL FROM:<${from}>\r\n`);
-      } else if (step === 5 && response.startsWith('250')) {
-        step = 6;
-        client.write(`RCPT TO:<${to}>\r\n`);
-      } else if (step === 6 && response.startsWith('250')) {
-        step = 7;
-        client.write('DATA\r\n');
-      } else if (step === 7 && response.startsWith('354')) {
-        step = 8;
-        const mailContent = [
-          `From: VIG Loans App <${from}>`,
-          `To: <${to}>`,
-          `Reply-To: ${replyTo}`,
-          `Subject: ${subject}`,
-          `MIME-Version: 1.0`,
-          `Content-Type: text/html; charset=UTF-8`,
-          ``,
-          htmlBody,
-          `.`
-        ].join('\r\n') + '\r\n';
-
-        client.write(mailContent);
-      } else if (step === 8 && response.startsWith('250')) {
-        step = 9;
-        client.write('QUIT\r\n');
-        resolve(true);
-      } else if (!response.startsWith('2') && !response.startsWith('3')) {
-        reject(new Error(`Error en comando SMTP (Paso ${step}): ${response.trim()}`));
-        client.end();
-      }
-    };
-
-    if (isDirectTls) {
-      client = tls.connect(targetPort, targetHost, { rejectUnauthorized: false }, () => {});
-    } else {
-      client = net.connect(targetPort, targetHost, () => {});
-    }
-
-    client.on('data', handleData);
-    client.on('error', (err) => reject(err));
-  });
-}
+// El cliente SMTP casero vivia aqui. Iba por TCP en claro al puerto 2525 y
+// nunca emitia STARTTLS, asi que la contrasena de SMTP2GO viajaba legible.
+// Sustituido por `lib/mailer.js` (nodemailer con TLS verificado).
 
 // -------------------- MANEJO DE ERRORES (después de todas las rutas) --------------------
 const { errorHandler, notFoundHandler } = require('./middleware/errorHandler');

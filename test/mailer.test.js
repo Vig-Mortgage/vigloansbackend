@@ -584,3 +584,37 @@ test('el asunto vacio o desmedido se rechaza', () => {
   );
   assert.equal(mailer.assertSubject('  Hola   mundo  '), 'Hola mundo');
 });
+
+// --- configuracion real del secreto `Mail` de VIG -------------------------
+
+test('MAIL_ENCRYPTION=ssl en el puerto 443 usa TLS implicito', () => {
+  // Es la configuracion real del secreto. mail.smtp2go.com habla TLS implicito
+  // en 443: el banner 220 llega despues del handshake. Si intentaramos
+  // STARTTLS contra un socket ya cifrado, el envio fallaria.
+  const { buildTransportOptions } = require('../lib/mailer');
+  const opts = buildTransportOptions({
+    MAIL_HOST: 'mail.smtp2go.com',
+    MAIL_PORT: '443',
+    MAIL_ENCRYPTION: 'ssl',
+    MAIL_USERNAME: 'usuario',
+    MAIL_PASSWORD: 'clave',
+  });
+
+  assert.equal(opts.host, 'mail.smtp2go.com');
+  assert.equal(opts.port, 443);
+  assert.equal(opts.secure, true, 'TLS implicito');
+  assert.equal(opts.requireTLS, false, 'no se pide STARTTLS sobre TLS');
+  assert.equal(opts.tls.rejectUnauthorized, true);
+});
+
+test('sin MAIL_ENCRYPTION implicito se sigue exigiendo STARTTLS', () => {
+  const { buildTransportOptions } = require('../lib/mailer');
+  const opts = buildTransportOptions({
+    MAIL_HOST: 'mail.smtp2go.com',
+    MAIL_PORT: '2525',
+    MAIL_USERNAME: 'usuario',
+    MAIL_PASSWORD: 'clave',
+  });
+  assert.equal(opts.secure, false);
+  assert.equal(opts.requireTLS, true, 'STARTTLS obligatorio, nunca claro');
+});
