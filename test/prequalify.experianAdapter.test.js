@@ -80,7 +80,6 @@ test('un SSN incompleto no llega al proveedor', () => {
 test('por defecto usa produccion', async () => {
   const { adaptador, llamadas } = construir({ usarUat: false });
   await adaptador.fetchCreditReport(SOLICITANTE);
-  assert.equal(adaptador._entorno, 'produccion');
   assert.match(llamadas[0].url, /^https:\/\/us-api\.experian\.com/);
   assert.equal(llamadas[0].opciones.headers.client_id, 'cid-prod');
   assert.equal(llamadas[1].body.requestor.subscriberCode, '1234567');
@@ -89,7 +88,6 @@ test('por defecto usa produccion', async () => {
 test('con usarUat apunta a UAT en las dos llamadas y con las claves _DEV', async () => {
   const { adaptador, llamadas } = construir({ usarUat: true });
   await adaptador.fetchCreditReport(SOLICITANTE);
-  assert.equal(adaptador._entorno, 'uat');
   for (const l of llamadas) assert.match(l.url, /^https:\/\/uat-us-api\.experian\.com/);
   assert.equal(llamadas[0].opciones.headers.client_id, 'cid-uat');
   assert.equal(llamadas[1].body.requestor.subscriberCode, '7654321');
@@ -193,6 +191,22 @@ test('una entrada invalida no gasta una consulta de credito', async () => {
 });
 
 // --- el reporte no se filtra ----------------------------------------------
+
+test('el puerto expone SOLO fetchCreditReport', () => {
+  // `createPorts` rechaza cualquier clave fuera del contrato. Un `_entorno` de
+  // conveniencia en el objeto devuelto tumbo el montaje entero en produccion
+  // el 2026-08-07: los tests de este fichero pasaban porque probaban el
+  // adaptador suelto, nunca a traves de `createPorts`.
+  const { adaptador } = construir();
+  assert.deepEqual(Object.keys(adaptador), ['fetchCreditReport']);
+});
+
+test('el adaptador es aceptado por createPorts', () => {
+  const { createPorts } = require('../lib/prequalify/ports');
+  const { adaptador } = construir();
+  const ports = createPorts({ experian: adaptador });
+  assert.equal(typeof ports.experian.fetchCreditReport, 'function');
+});
 
 test('devuelve el reporte crudo para que lo parsee la capa de dominio', async () => {
   const crudo = { creditProfile: [{ riskModel: [{ modelIndicator: 'AF', score: '712' }] }] };
