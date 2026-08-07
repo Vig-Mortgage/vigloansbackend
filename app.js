@@ -850,7 +850,7 @@ app.post('/mergePDFs', verificarJWT, async (req, res) => {
 
 // -------------------- ENDPOINT DE CONTACTO DE SOPORTE --------------------
 // Envía un correo con los datos del formulario a info@vigmortgage.com
-app.post('/support/contact', verificarJWT, async (req, res) => {
+app.post('/support/contact', async (req, res) => {
   try {
     const { name, email, subject, message } = req.body;
 
