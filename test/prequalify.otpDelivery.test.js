@@ -3,6 +3,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
+const { ALLOWED_MESSAGE_FIELDS, buildEnvelope } = require('../lib/mailer');
 const {
   createOtpDeliveryAdapter,
   _aE164,
@@ -178,6 +179,30 @@ test('whatsapp usa la plantilla aprobada con el codigo en cuerpo y boton', async
 // ---------------------------------------------------------------------------
 // Correo
 // ---------------------------------------------------------------------------
+
+test('email pasa a sendMail SOLO los campos que admite', async () => {
+  // Este test existe por un fallo real: el mock de `sendMail` aceptaba
+  // cualquier objeto, asi que no vio que se le estaba pasando el mensaje con
+  // sus metadatos (`template`, `locale`, `containsSecret`). El mailer de
+  // verdad los rechaza y el OTP moria con 400 en produccion.
+  //
+  // La comprobacion se hace contra `ALLOWED_MESSAGE_FIELDS` del propio mailer
+  // y, ademas, pasando el resultado por su `buildEnvelope` real — que es
+  // exactamente quien lanzaba.
+  const { adaptador, llamadas } = construir();
+  await adaptador.send({
+    channel: 'email',
+    destination: 'roberto@vigpr.com',
+    code: '111222',
+    ttlSeconds: 600,
+    locale: 'es',
+  });
+
+  const { mail } = llamadas[0];
+  const sobrantes = Object.keys(mail).filter((k) => !ALLOWED_MESSAGE_FIELDS.includes(k));
+  assert.deepEqual(sobrantes, [], `campos que sendMail rechazaria: ${sobrantes.join(', ')}`);
+  assert.doesNotThrow(() => buildEnvelope(mail));
+});
 
 test('email manda la plantilla otpCode y devuelve el messageId', async () => {
   const { adaptador, llamadas } = construir();
