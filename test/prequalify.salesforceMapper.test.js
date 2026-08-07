@@ -276,9 +276,15 @@ test('la direccion actual cae en los campos estandar del Lead', () => {
   assert.ok(!('unit' in fields));
 });
 
-test('la direccion anterior usa los campos con sufijo 2 y no lleva mayusculas', () => {
-  // accionDireccionAnterior.php:167-177 no aplica strtoupper a street2__c ni a
-  // Housing2__c, al reves que la direccion actual. Se replica la asimetria.
+test('la direccion anterior NO se mapea: Salesforce no tiene donde guardarla', () => {
+  // Verificado contra la org de produccion el 2026-08-07: el Lead no tiene
+  // `street2__c`, `unit2__c`, `cbocity2__c`, `cbostate2__c` ni `zip2__c`.
+  // Se habian portado de `accionDireccionAnterior.php`, que es codigo muerto en
+  // el legacy (su POST esta comentado), asi que nunca se ejecutaron contra
+  // Salesforce y nadie descubrio que los campos no existian.
+  //
+  // Este test es un candado: si alguien vuelve a mapearlos sin haberlos creado
+  // primero en Salesforce, la primera solicitud real fallaria con INVALID_FIELD.
   const fields = mapper.toLeadFields({
     previousAddress: {
       line1: 'Calle Sol 4',
@@ -293,22 +299,11 @@ test('la direccion anterior usa los campos con sufijo 2 y no lleva mayusculas', 
     },
   });
 
-  assert.deepEqual(fields, {
-    street2__c: 'Calle Sol 4',
-    unit2__c: 'B',
-    cbocity2__c: 'Caguas',
-    cbostate2__c: 'PR',
-    zip2__c: '00725',
-    Housing2__c: 'Own',
-    rentMonth2__c: 0,
-    yearsCurrentAddress2__c: 3,
-    monthsCurrentAddress2__c: 0,
-  });
+  assert.deepEqual(fields, {}, 'la direccion anterior no debe producir ningun campo');
+  for (const inexistente of ['street2__c', 'unit2__c', 'cbocity2__c', 'cbostate2__c', 'zip2__c']) {
+    assert.ok(!(inexistente in fields), `${inexistente} no existe en Salesforce`);
+  }
 });
-
-// ---------------------------------------------------------------------------
-// toLeadFields: co-deudor y calificacion
-// ---------------------------------------------------------------------------
 
 test('el lead del co-deudor lleva Coborrower__c y el enlace al deudor', () => {
   const fields = mapper.toLeadFields({
@@ -625,6 +620,8 @@ test('fromLeadRecord devuelve el modelo camelCase de la API', () => {
     },
     legacyStep: 2,
     currentStep: 'currentAddress',
+    // Derivado, no leido: Salesforce no tiene campo para la lista.
+    completedSteps: ['start', 'otpVerify', 'personal'],
   });
 });
 
@@ -687,4 +684,34 @@ test('cada entrada del mapeo cita su origen en el legacy', () => {
 test('ningun campo de Salesforce esta mapeado dos veces', () => {
   const campos = mapper.LEAD_FIELD_MAP.map((entrada) => entrada.sf);
   assert.equal(new Set(campos).size, campos.length);
+});
+
+// --- completedSteps derivado ---------------------------------------------
+
+test('completedSteps se deriva de currentStep__c porque Salesforce no lo guarda', () => {
+  // No existe ningun campo donde persistir la lista (verificado contra
+  // produccion el 2026-08-07) y no hay acceso de admin para crearlo. Se deriva:
+  // si el lead va por el paso N, los aplicables anteriores estan hechos.
+  const paso3 = mapper.fromLeadRecord({ Id: '00Q1', LastName: 'X', currentStep__c: '3' });
+  assert.deepEqual(paso3.completedSteps, [
+    'start', 'otpVerify', 'personal', 'currentAddress', 'creditCheck',
+  ]);
+  assert.equal(paso3.currentStep, 'employment');
+});
+
+test('completedSteps crece de forma monotona con currentStep__c', () => {
+  let anterior = 0;
+  for (const n of ['1', '2', '3', '4', '5']) {
+    const r = mapper.fromLeadRecord({ Id: '00Q1', LastName: 'X', currentStep__c: n });
+    assert.ok(
+      r.completedSteps.length > anterior,
+      `currentStep__c=${n} deberia completar mas pasos que el anterior`
+    );
+    anterior = r.completedSteps.length;
+  }
+});
+
+test('sin currentStep__c no se inventan pasos completados', () => {
+  const r = mapper.fromLeadRecord({ Id: '00Q1', LastName: 'X' });
+  assert.equal(r.completedSteps, undefined);
 });

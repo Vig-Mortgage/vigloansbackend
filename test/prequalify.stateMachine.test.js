@@ -15,7 +15,6 @@ const {
   resumeStep,
   fromLegacyStep,
   toLegacyStep,
-  needsPreviousAddress,
   MIN_MONTHS_AT_CURRENT_ADDRESS,
 } = require('../lib/prequalify/stateMachine');
 
@@ -54,76 +53,39 @@ test('credito conjunto intercala el paso de co-deudor antes de submit', () => {
   assert.equal(nextStep(Step.INCOME, INDIVIDUAL), Step.SUBMIT);
 });
 
-test('las direcciones opcionales solo entran si el contexto lo pide', () => {
+test('la direccion postal solo entra si el contexto lo pide', () => {
   assert.equal(nextStep(Step.CURRENT_ADDRESS, INDIVIDUAL), Step.CREDIT_CHECK);
-
-  assert.equal(
-    nextStep(Step.CURRENT_ADDRESS, { ...INDIVIDUAL, needsPreviousAddress: true }),
-    Step.PREVIOUS_ADDRESS
-  );
   assert.equal(
     nextStep(Step.CURRENT_ADDRESS, { ...INDIVIDUAL, mailingAddressDiffers: true }),
     Step.MAILING_ADDRESS
   );
-  // Con ambas, respeta el orden del formulario legacy: anterior antes que postal.
-  const ambas = { ...INDIVIDUAL, needsPreviousAddress: true, mailingAddressDiffers: true };
-  assert.equal(nextStep(Step.CURRENT_ADDRESS, ambas), Step.PREVIOUS_ADDRESS);
-  assert.equal(nextStep(Step.PREVIOUS_ADDRESS, ambas), Step.MAILING_ADDRESS);
-  assert.equal(nextStep(Step.MAILING_ADDRESS, ambas), Step.CREDIT_CHECK);
-});
-
-// --- regla URLA: direccion anterior si <2 anos en la actual ---------------
-
-test('needsPreviousAddress se deriva del tiempo en la direccion actual', () => {
-  assert.equal(MIN_MONTHS_AT_CURRENT_ADDRESS, 24);
-  // Menos de 2 anos -> hay que pedirla.
-  assert.equal(needsPreviousAddress({ currentAddressYears: 1, currentAddressMonths: 11 }), true);
-  assert.equal(needsPreviousAddress({ currentAddressYears: 0, currentAddressMonths: 3 }), true);
-  // Justo 2 anos o mas -> no.
-  assert.equal(needsPreviousAddress({ currentAddressYears: 2, currentAddressMonths: 0 }), false);
-  assert.equal(needsPreviousAddress({ currentAddressYears: 5, currentAddressMonths: 6 }), false);
-});
-
-test('needsPreviousAddress acepta anos o meses por separado', () => {
-  assert.equal(needsPreviousAddress({ currentAddressMonths: 30 }), false);
-  assert.equal(needsPreviousAddress({ currentAddressMonths: 12 }), true);
-  assert.equal(needsPreviousAddress({ currentAddressYears: 3 }), false);
-});
-
-test('needsPreviousAddress: la bandera explicita gana sobre lo derivado', () => {
   assert.equal(
-    needsPreviousAddress({ needsPreviousAddress: true, currentAddressYears: 10 }),
-    true
-  );
-  assert.equal(
-    needsPreviousAddress({ needsPreviousAddress: false, currentAddressYears: 0, currentAddressMonths: 1 }),
-    false
+    nextStep(Step.MAILING_ADDRESS, { ...INDIVIDUAL, mailingAddressDiffers: true }),
+    Step.CREDIT_CHECK
   );
 });
 
-test('needsPreviousAddress es false si no hay dato de tiempo', () => {
-  assert.equal(needsPreviousAddress({}), false);
-  assert.equal(needsPreviousAddress(), false);
-});
+// --- la direccion anterior se ELIMINO -------------------------------------
+//
+// Salesforce no tiene donde guardar la calle/ciudad/estado/ZIP de la direccion
+// anterior (verificado contra produccion el 2026-08-07), asi que el paso entero
+// se quito. Con el se fueron `needsPreviousAddress` y
+// `MIN_MONTHS_AT_CURRENT_ADDRESS`, y con ellos la regla URLA de los 24 meses.
+//
+// Estos dos tests son el candado: si algun dia se crean los campos y se
+// reactiva el paso, fallan y obligan a revisar todo lo que dependia de la regla.
 
-test('el wizard intercala la direccion anterior cuando lleva <2 anos', () => {
-  const recienMudado = { ...INDIVIDUAL, currentAddressYears: 1, currentAddressMonths: 0 };
-  assert.equal(nextStep(Step.CURRENT_ADDRESS, recienMudado), Step.PREVIOUS_ADDRESS);
-  assert.equal(nextStep(Step.PREVIOUS_ADDRESS, recienMudado), Step.CREDIT_CHECK);
-
+test('tras la direccion actual se pasa al credito, viva donde viva', () => {
+  const recienMudado = { ...INDIVIDUAL, currentAddressYears: 0, currentAddressMonths: 1 };
   const arraigado = { ...INDIVIDUAL, currentAddressYears: 8, currentAddressMonths: 0 };
+
+  assert.equal(nextStep(Step.CURRENT_ADDRESS, recienMudado), Step.CREDIT_CHECK);
   assert.equal(nextStep(Step.CURRENT_ADDRESS, arraigado), Step.CREDIT_CHECK);
 });
 
-test('canEnter bloquea el credito si falta la direccion anterior exigida', () => {
-  const state = {
-    ...INDIVIDUAL,
-    currentAddressYears: 0,
-    currentAddressMonths: 8,
-    completedSteps: [Step.START, Step.OTP_VERIFY, Step.PERSONAL, Step.CURRENT_ADDRESS],
-  };
-  assert.equal(canEnter(Step.PREVIOUS_ADDRESS, state), true);
-  assert.equal(canEnter(Step.CREDIT_CHECK, state), false);
+test('el paso de direccion anterior ya no existe en la maquina de estados', () => {
+  assert.equal(Step.PREVIOUS_ADDRESS, undefined);
+  assert.ok(!STEP_ORDER.includes('previousAddress'));
 });
 
 test('nextStep es idempotente en el estado terminal', () => {
@@ -152,7 +114,6 @@ test('requiredSteps refleja el contexto y excluye DONE', () => {
 test('appliesTo: los pasos obligatorios aplican siempre', () => {
   assert.equal(appliesTo(Step.PERSONAL, {}), true);
   assert.equal(appliesTo(Step.COBORROWER, {}), false);
-  assert.equal(appliesTo(Step.PREVIOUS_ADDRESS, {}), false);
 });
 
 // --- canEnter -------------------------------------------------------------
@@ -181,13 +142,13 @@ test('canEnter no exige los pasos opcionales que no aplican', () => {
     ...INDIVIDUAL,
     completedSteps: [Step.START, Step.OTP_VERIFY, Step.PERSONAL, Step.CURRENT_ADDRESS],
   };
-  // previousAddress no aplica, asi que no bloquea el paso de credito.
+  // mailingAddress no aplica, asi que no bloquea el paso de credito.
   assert.equal(canEnter(Step.CREDIT_CHECK, state), true);
 
   // Pero si aplica y falta, si bloquea.
-  const conAnterior = { ...state, needsPreviousAddress: true };
-  assert.equal(canEnter(Step.CREDIT_CHECK, conAnterior), false);
-  assert.equal(canEnter(Step.PREVIOUS_ADDRESS, conAnterior), true);
+  const conPostal = { ...state, mailingAddressDiffers: true };
+  assert.equal(canEnter(Step.CREDIT_CHECK, conPostal), false);
+  assert.equal(canEnter(Step.MAILING_ADDRESS, conPostal), true);
 });
 
 test('canEnter rechaza pasos que no aplican, desconocidos o terminales', () => {

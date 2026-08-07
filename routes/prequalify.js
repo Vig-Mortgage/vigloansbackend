@@ -339,12 +339,6 @@ function createPrequalifyRouter({ ports, otpService, sessions } = {}) {
   stepRoute('put', '/leads/:id/addresses', Step.CURRENT_ADDRESS, schemas.currentAddressSchema);
   stepRoute(
     'put',
-    '/leads/:id/addresses/previous',
-    Step.PREVIOUS_ADDRESS,
-    schemas.previousAddressSchema
-  );
-  stepRoute(
-    'put',
     '/leads/:id/addresses/mailing',
     Step.MAILING_ADDRESS,
     schemas.mailingAddressSchema

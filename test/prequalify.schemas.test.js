@@ -353,7 +353,6 @@ test('stepSchemas cubre cada paso que recibe datos del cliente', () => {
     'otpVerify',
     'personal',
     'currentAddress',
-    'previousAddress',
     'mailingAddress',
     'employment',
     'income',
