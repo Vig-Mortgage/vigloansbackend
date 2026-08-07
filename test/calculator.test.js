@@ -78,6 +78,21 @@ test('VA purchase exento de funding fee → upfront 0', () => {
   assert.strictEqual(q.loanBase, 250000);
 });
 
+test('VA funding fee es OPCIONAL: exento => 0, no exento => >0 (mismos inputs)', () => {
+  const base = {
+    transactionType: 'purchase', loanType: 'VA', price: 250000, years: 30, interest: 6,
+    downPaymentMode: 'percent', downPaymentValue: 0, isVaFirstTime: true,
+    taxes: 0, insurance: 0, hoa: 0,
+  };
+  const noExento = computeQuote({ ...base, isVaFundingFeeExempt: false });
+  const exento = computeQuote({ ...base, isVaFundingFeeExempt: true });
+  assert.ok(noExento.upfrontFee > 0, `no exento debe cobrar fee, fue ${noExento.upfrontFee}`);
+  assert.strictEqual(exento.upfrontFee, 0);
+  // Al eximir el fee, el préstamo financiado y el pago mensual bajan.
+  assert.ok(exento.totalLoanAmount < noExento.totalLoanAmount);
+  assert.ok(exento.totalMonthlyPayment < noExento.totalMonthlyPayment);
+});
+
 test('VA purchase first-time, 0% down → funding fee 2.15%', () => {
   const q = computeQuote({
     transactionType: 'purchase', loanType: 'VA', price: 250000, years: 30, interest: 6,

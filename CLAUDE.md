@@ -2,6 +2,8 @@
 
 Node/Express. Es el **backend único** del ecosistema VIG: hoy sirve a la app Flutter; se expande para servir también la **precualificación** (Flutter + Next.js) y la **calculadora** como API.
 
+> **Arquitectura y convenciones detalladas: ver [`ARCHITECTURE.md`](./ARCHITECTURE.md).** Todo lo nuevo sigue el patrón `routes/` (delgado) + `lib/` (dominio puro) + `middleware/` (validate/asyncHandler/errorHandler) + `lib/logger.js`, con tests en `test/` (`npm test` = `node --test`). El monolito `app.js` se extrae por dominios de forma incremental, sin reescribir de golpe.
+
 ## Stack y ejecución
 - Node + Express, `pm2` (`ecosystem.config.js`). Entrada actual: `app.js` (monolito — en refactor a `src/`).
 - Secretos: **AWS Secrets Manager** con caché TTL. Credenciales AWS por **IAM role** de la instancia/tarea (no keys de larga vida en env).

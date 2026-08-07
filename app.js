@@ -1098,6 +1098,12 @@ function sendSmtpEmail({ host, port, username, password, from, to, replyTo, subj
     client.on('error', (err) => reject(err));
   });
 }
+
+// -------------------- MANEJO DE ERRORES (después de todas las rutas) --------------------
+const { errorHandler, notFoundHandler } = require('./middleware/errorHandler');
+app.use(notFoundHandler);   // 404 JSON para rutas no registradas
+app.use(errorHandler);      // manejador central: no filtra internals al cliente
+
 // -------------------- INICIAR EL SERVIDOR --------------------
 // Precargar secretos antes de que el servidor acepte conexiones
 async function startServer() {

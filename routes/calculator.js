@@ -2,16 +2,19 @@
 
 /**
  * Router de la calculadora hipotecaria (API pública, sin datos sensibles).
- * POST /calculator/quote  → cálculo completo del pago mensual.
- * GET  /calculator/config → límites y tablas de tasas (para poblar la UI).
+ *   POST /calculator/quote  → cálculo completo del pago mensual.
+ *   GET  /calculator/config → límites y tablas de tasas (para poblar la UI).
  *
- * Validación de entrada con zod. Este router es la fuente única de cálculo
- * para Flutter y Next.js.
+ * Fuente única de cálculo para Flutter y Next.js.
+ * Usa el patrón estándar del backend: validate(zod) + asyncHandler + logger.
  */
 
 const express = require('express');
 const { z } = require('zod');
 const { computeQuote, CALC_CONFIG } = require('../lib/calculator');
+const validate = require('../middleware/validate');
+const asyncHandler = require('../middleware/asyncHandler');
+const logger = require('../lib/logger');
 
 const router = express.Router();
 
@@ -31,34 +34,37 @@ const QuoteSchema = z.object({
   isCashOut: z.boolean().optional(),
   cashOutAmount: z.number().min(0).optional(),
   isVaReserve: z.boolean().optional(),
+  // Funding Fee del préstamo VA: OPCIONAL. true => exento (upfrontFee = 0).
   isVaFundingFeeExempt: z.boolean().optional(),
   includeAmortization: z.boolean().optional(),
 });
 
-router.post('/quote', (req, res) => {
-  const parsed = QuoteSchema.safeParse(req.body);
-  if (!parsed.success) {
-    return res.status(400).json({
-      error: 'Parámetros inválidos.',
-      details: parsed.error.issues.map((i) => ({ path: i.path.join('.'), message: i.message })),
+router.post(
+  '/quote',
+  validate(QuoteSchema),
+  asyncHandler(async (req, res) => {
+    const quote = computeQuote(req.validated.body);
+    logger.info('calculator.quote', {
+      loanType: req.validated.body.loanType,
+      transactionType: req.validated.body.transactionType,
+      vaExempt: !!req.validated.body.isVaFundingFeeExempt,
     });
-  }
-  try {
-    const quote = computeQuote(parsed.data);
-    return res.json(quote);
-  } catch (err) {
-    console.error('Error en /calculator/quote:', err.message);
-    return res.status(500).json({ error: 'Error interno al calcular la cotización.' });
-  }
-});
+    res.json(quote);
+  })
+);
 
-router.get('/config', (req, res) => {
-  res.json({
-    limits: CALC_CONFIG.limits,
-    insuranceDefaultRate: CALC_CONFIG.insurance.defaultRate,
-    creditScores: ['760', '740-759', '720-739', '700-719'],
-    loanTypes: ['FHA', 'VA', 'USDA', 'CONV'],
-  });
-});
+router.get(
+  '/config',
+  asyncHandler(async (req, res) => {
+    res.json({
+      limits: CALC_CONFIG.limits,
+      insuranceDefaultRate: CALC_CONFIG.insurance.defaultRate,
+      creditScores: ['760', '740-759', '720-739', '700-719'],
+      loanTypes: ['FHA', 'VA', 'USDA', 'CONV'],
+      // El funding fee VA puede marcarse como exento con isVaFundingFeeExempt=true.
+      vaFundingFeeExemptSupported: true,
+    });
+  })
+);
 
 module.exports = router;
