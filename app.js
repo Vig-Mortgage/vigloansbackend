@@ -125,6 +125,11 @@ app.use(cors({
 }));
 app.use(express.json({ limit: '10mb' }));
 
+// -------------------- CALCULADORA HIPOTECARIA (API, fuente única) --------------------
+// Cálculo hipotecario centralizado, consumido por Flutter y Next.js.
+// Endpoints: POST /calculator/quote, GET /calculator/config.
+app.use('/calculator', require('./routes/calculator'));
+
 // -------------------- HEALTH CHECK ENDPOINT --------------------
 app.get('/health', (req, res) => {
   res.status(200).json({
