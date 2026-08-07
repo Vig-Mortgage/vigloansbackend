@@ -354,10 +354,34 @@ function createPrequalifyRouter({ ports, otpService, sessions } = {}) {
     authorizeLead,
     requireStep(Step.CREDIT_CHECK),
     asyncHandler(async (req, res) => {
-      // El puerto trae el reporte; el parseo y la decision viven en
-      // `lib/prequalify/experian.js` y `decision.js` (Tarea B6).
-      await ports.experian.fetchCreditReport({ leadId: req.prequal.leadId });
-      // Sin proveedor configurado no se llega aqui: el puerto lanza 501.
+      // TODO(Roberto): faltan DOS cosas para cerrar este paso, y ninguna es el
+      // proveedor — el adaptador de Experian ya esta escrito, cableado y
+      // probado contra UAT con reportes reales.
+      //
+      // 1. EL ADAPTADOR DE SALESFORCE. `fetchCreditReport` necesita nombre,
+      //    apellido, fecha de nacimiento y direccion del solicitante. Eso vive
+      //    en el Lead, y hoy no hay con que leerlo.
+      //
+      // 2. DE DONDE SALE EL SSN. Es una decision de diseno, no un cableado.
+      //    El SSN se escribe en Salesforce y **nunca se relee** a proposito
+      //    (`salesforceMapper.js`, SENSITIVE_LEAD_FIELDS), asi que no se puede
+      //    recuperar de ahi para la consulta. Las opciones:
+      //
+      //      a) Que el cliente lo reenvie en esta peticion, como hacia el
+      //         legacy (`scripts.js:1010-1029`). Simple, pero el SSN vuelve a
+      //         viajar por la red y a estar en memoria del navegador.
+      //      b) Guardarlo server-side entre el paso `personal` y este, atado a
+      //         la sesion y con vida corta. No vuelve a viajar, pero hay que
+      //         decidir donde vive (hoy el almacen de OTP es en memoria y no
+      //         sirve multi-instancia) y garantizar que se borra.
+      //
+      //    (b) es mejor para el dato pero exige infraestructura; (a) es lo que
+      //    ya funciona en produccion hoy. Hay que elegir antes de escribir el
+      //    codigo, porque el contrato del endpoint cambia segun la opcion.
+      //
+      // Mientras tanto se responde 501 explicitamente, sin llamar al puerto:
+      // llamarlo con datos incompletos daria un 502 de Experian y haria pensar
+      // que el problema es del proveedor.
       res.status(501).json({ error: 'Este servicio no esta disponible en este momento.' });
     })
   );

@@ -104,6 +104,15 @@ app.use(
         getTwilioSecrets,
         getWhatsappSecrets,
       }),
+      // Reporte de credito. El entorno lo decide `EXPERIAN_USE_UAT` en el
+      // despliegue, no el codigo: la misma imagen sirve para UAT y produccion.
+      //
+      // Probado contra UAT el 2026-08-07 con las dos personas de prueba de
+      // Experian: reportes reales de 48 y 25 tradelines, parseados y llevados
+      // hasta la decision. Ver `lib/prequalify/adapters/experianReport.js`.
+      experian: require('./lib/prequalify/adapters/experianReport').createExperianAdapter({
+        getExperianSecrets: () => getSecret('prod/experian'),
+      }),
     },
   })
 );
