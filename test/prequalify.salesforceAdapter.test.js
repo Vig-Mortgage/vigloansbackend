@@ -314,3 +314,134 @@ test('un secreto incompleto falla antes de salir a la red', async () => {
   await assert.rejects(adaptador.getLead(LEAD_ID), /le faltan claves/);
   assert.equal(llamadas.length, 0);
 });
+
+// --- objetos hijos ---------------------------------------------------------
+
+/** Recoge los POST a objetos hijos. */
+function conEscrituras() {
+  return construir({
+    permitirEscrituras: true,
+    respuestas: (url, o) => {
+      if (o.method === 'POST' && url.includes('/sobjects/')) return texto(201, { id: 'a0X1', success: true });
+      if (o.method === 'PATCH') return texto(204, '');
+      return null;
+    },
+  });
+}
+
+const posts = (llamadas, sobject) =>
+  llamadas.filter((l) => l.opciones.method === 'POST' && l.url.includes(`/sobjects/${sobject}`));
+
+test('el paso de empleo crea Employment_SelfEmployment__c', async () => {
+  const { adaptador, llamadas } = conEscrituras();
+  await adaptador.updateLead(LEAD_ID, {
+    employerBusinessName: 'Acme Corp', positionTitle: 'Ingeniero',
+    startDate: '2020-01-15', employerPhone: '7871234567',
+    line1: 'Ave 1', city: 'Ponce', state: 'PR', zipCode: '00731',
+    yearsEmployment: 5, monthsEmployment: 2,
+  }, { step: 'employment' });
+
+  const [post] = posts(llamadas, 'Employment_SelfEmployment__c');
+  assert.ok(post, 'debe crear el registro de empleo');
+  const r = JSON.parse(post.opciones.body);
+  assert.equal(r.Lead__c, LEAD_ID);
+  assert.equal(r.EmployerBusinessName__c, 'ACME CORP');
+  assert.equal(r.PositionTitle__c, 'INGENIERO');
+});
+
+test('el paso de ingresos crea Income__c con el mensual ya derivado', async () => {
+  const { adaptador, llamadas } = conEscrituras();
+  await adaptador.updateLead(LEAD_ID, {
+    grossPayPerPeriod: 3000, incomeFrequency: 'Biweekly',
+    // Lo deriva el router con `income.js`; el adaptador solo lo persiste.
+    monthlyIncome: 6500,
+    businessOwnerOrSelfEmployed: false, retiredOrPensioner: false, paysChildSupport: false,
+  }, { step: 'income' });
+
+  const [post] = posts(llamadas, 'Income__c');
+  assert.ok(post, 'debe crear el registro de ingresos');
+  const r = JSON.parse(post.opciones.body);
+  // Los nombres estan invertidos EN LA ORG: `MonthlyIncome__c` guarda el pago
+  // por periodo y `TotalIncome__c` el mensual. Se respeta el legacy.
+  assert.equal(r.MonthlyIncome__c, 3000);
+  assert.equal(r.TotalIncome__c, 6500);
+  assert.equal(r.IncomeFrequency__c, 'Biweekly');
+});
+
+test('la direccion POSTAL crea MailingAddress__c y NO toca el Lead', async () => {
+  // Este test es el motivo de que el paso viaje explicito: `currentAddress` y
+  // `mailingAddress` mandan los mismos nombres de campo. Sin el paso, la
+  // postal se escribiria encima de la fisica del Lead.
+  const { adaptador, llamadas } = conEscrituras();
+  await adaptador.updateLead(LEAD_ID, {
+    line1: 'PO Box 99', city: 'Cabo Rojo', state: 'PR', zipCode: '00623',
+    housing: 'Own', years: 3, months: 0,
+  }, { step: 'mailingAddress' });
+
+  const [post] = posts(llamadas, 'MailingAddress__c');
+  assert.ok(post, 'debe crear el registro de direccion postal');
+  const r = JSON.parse(post.opciones.body);
+  assert.equal(r.StreetMailAddress__c, 'PO Box 99');
+  assert.equal(r.cbocityMailAddress__c, 'Cabo Rojo');
+
+  const patch = llamadas.find((l) => l.opciones.method === 'PATCH');
+  if (patch) {
+    const enLead = JSON.parse(patch.opciones.body);
+    assert.ok(!('Street' in enLead), 'la postal no puede sobrescribir Street del Lead');
+    assert.ok(!('City' in enLead), 'la postal no puede sobrescribir City del Lead');
+  }
+});
+
+test('la direccion FISICA va al Lead y no crea ningun hijo', async () => {
+  const { adaptador, llamadas } = conEscrituras();
+  await adaptador.updateLead(LEAD_ID, {
+    line1: 'CALLE LUNA 12', city: 'Ponce', state: 'PR', zipCode: '00731',
+    housing: 'Own', years: 5, months: 0,
+  }, { step: 'currentAddress' });
+
+  assert.equal(posts(llamadas, 'MailingAddress__c').length, 0);
+  const patch = llamadas.find((l) => l.opciones.method === 'PATCH');
+  const enLead = JSON.parse(patch.opciones.body);
+  assert.equal(enLead.Street, 'CALLE LUNA 12');
+  assert.equal(enLead.City, 'Ponce');
+});
+
+test('un paso sin objeto hijo no crea ninguno', async () => {
+  const { adaptador, llamadas } = conEscrituras();
+  await adaptador.updateLead(LEAD_ID, { citizenship: 'U.S. Citizen' }, { step: 'personal' });
+  // Filtrando por `/sobjects/`: el POST de autenticacion tambien es POST.
+  const hijos = llamadas.filter(
+    (l) => l.opciones.method === 'POST' && l.url.includes('/sobjects/')
+  );
+  assert.equal(hijos.length, 0);
+});
+
+test('con las escrituras apagadas tampoco se crean hijos', async () => {
+  const { adaptador, llamadas } = construir({ permitirEscrituras: false });
+  await adaptador.updateLead(LEAD_ID, {
+    grossPayPerPeriod: 3000, incomeFrequency: 'Biweekly', monthlyIncome: 6500,
+  }, { step: 'income' });
+  assert.equal(llamadas.length, 0);
+});
+
+test('el hijo se crea ANTES de marcar el Lead', async () => {
+  // Si el hijo falla, el Lead no debe quedar como si el paso hubiera cuajado.
+  const { adaptador, llamadas } = construir({
+    permitirEscrituras: true,
+    respuestas: (url, o) =>
+      o.method === 'POST' && url.includes('/sobjects/Income__c')
+        ? texto(400, [{ errorCode: 'FIELD_CUSTOM_VALIDATION_EXCEPTION', message: 'nope' }])
+        : o.method === 'PATCH'
+          ? texto(204, '')
+          : null,
+  });
+
+  await assert.rejects(
+    adaptador.updateLead(LEAD_ID, {
+      grossPayPerPeriod: 3000, incomeFrequency: 'Biweekly', monthlyIncome: 6500,
+    }, { step: 'income' }),
+    /FIELD_CUSTOM_VALIDATION_EXCEPTION/
+  );
+  assert.equal(llamadas.filter((l) => l.opciones.method === 'PATCH').length, 0,
+    'no debe tocar el Lead si el hijo fallo');
+});

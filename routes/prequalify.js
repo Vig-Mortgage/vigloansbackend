@@ -38,6 +38,7 @@ const schemas = require('../lib/prequalify/schemas');
 // El parseo del reporte vive en el dominio, no en el adaptador: este router
 // solo lo invoca y guarda los dos numeros que sobreviven al reporte.
 const { parseCreditReport, toDecisionInput } = require('../lib/prequalify/experian');
+const { monthlyIncomeFrom } = require('../lib/prequalify/income');
 
 /** Mensaje unico para todo fallo de verificacion de OTP (anti-enumeracion). */
 const OTP_FALLO = 'El codigo no es valido o expiro. Solicita uno nuevo.';
@@ -164,13 +165,21 @@ function createPrequalifyRouter({ ports, otpService, sessions } = {}) {
     const leadId = req.prequal.leadId;
     const completedSteps = [...new Set([...(req.lead.completedSteps ?? []), step])];
 
+    // El ingreso mensual se deriva AQUI y no en el cliente: es la regla de
+    // Fannie Mae B3-3.1-03 y el legacy la tenia duplicada en el JS
+    // (`scripts.js:1358-1385`) y en el PHP. `Income__c` guarda los dos numeros
+    // con los nombres invertidos que ya tiene la org (ver el mapper).
+    const datos =
+      step === Step.INCOME ? { ...fields, monthlyIncome: monthlyIncomeFrom(fields) } : fields;
+
     // `completedSteps` viaja con los datos del paso. Sin esto la marca vive solo
     // en memoria del request y el lead nunca avanza: al volver, `resumeStep`
     // devolveria siempre el mismo paso.
-    // TODO(Roberto): hace falta un campo en el Lead donde persistirlo. El
-    // `currentStep__c` legacy es un solo numero y no distingue "hice el paso 3
-    // pero me falta el 2", que si puede pasar con los pasos opcionales.
-    await ports.salesforce.updateLead(leadId, { ...fields, completedSteps });
+    //
+    // El PASO va explicito: `currentAddress` y `mailingAddress` mandan los
+    // mismos nombres de campo, asi que el adaptador no puede distinguirlos por
+    // el contenido y escribiria la direccion postal encima de la fisica.
+    await ports.salesforce.updateLead(leadId, { ...datos, completedSteps }, { step });
 
     const contexto = { ...req.lead, completedSteps };
     const siguiente = nextStep(step, contexto);
