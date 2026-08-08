@@ -113,6 +113,16 @@ app.use(
       experian: require('./lib/prequalify/adapters/experianReport').createExperianAdapter({
         getExperianSecrets: () => getSecret('prod/experian'),
       }),
+      // Persistencia del lead.
+      //
+      // Las ESCRITURAS estan apagadas mientras `SALESFORCE_WRITES_ENABLED` no
+      // valga 'true'. Hoy no hay sandbox: la unica org es la de produccion, con
+      // ~20.900 leads reales. Asi el adaptador queda cableado y las lecturas
+      // funcionan sin ensuciar nada. Encenderlas es cambiar una variable, pero
+      // es una decision de Roberto.
+      salesforce: require('./lib/prequalify/adapters/salesforceLead').createSalesforceLeadAdapter({
+        getSalesforceSecrets: () => getSecret('Salesforce'),
+      }),
     },
   })
 );
