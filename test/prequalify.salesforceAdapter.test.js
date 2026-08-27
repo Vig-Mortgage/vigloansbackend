@@ -40,7 +40,16 @@ function texto(status, cuerpo) {
  * `respuestas` es una funcion (url, opciones) -> respuesta; si no se pasa,
  * autentica bien y devuelve una query vacia.
  */
-function construir({ respuestas, permitirEscrituras = false, usarSandbox = false, ahora } = {}) {
+function construir({
+  respuestas,
+  permitirEscrituras = false,
+  usarSandbox = false,
+  ahora,
+  // Por defecto la org NO tiene Client Credentials activo: es el caso de
+  // produccion hoy, y deja que los tests del flujo de contrasena sigan
+  // ejercitando el camino que de verdad se usa.
+  clientCredentials = false,
+} = {}) {
   const llamadas = [];
   const adaptador = createSalesforceLeadAdapter({
     getSalesforceSecrets: async () => SECRETO,
@@ -54,6 +63,11 @@ function construir({ respuestas, permitirEscrituras = false, usarSandbox = false
         if (r) return r;
       }
       if (url.includes('/oauth2/token')) {
+        const grant = new URLSearchParams(opciones.body).get('grant_type');
+        if (grant === 'client_credentials' && !clientCredentials) {
+          // Lo que devuelve Salesforce cuando el flujo no esta habilitado.
+          return texto(400, { error: 'invalid_grant', error_description: 'authentication failure' });
+        }
         return texto(200, { access_token: 'tok-abc', instance_url: INSTANCIA });
       }
       return texto(200, { records: [] });
@@ -61,6 +75,28 @@ function construir({ respuestas, permitirEscrituras = false, usarSandbox = false
   });
   return { adaptador, llamadas };
 }
+
+/** Las llamadas SOQL, para no depender de indices que cambian con los flujos. */
+const queries = (llamadas) => llamadas.filter((l) => l.url.includes('/query'));
+
+/**
+ * Cuantas AUTENTICACIONES hubo, no cuantos POST de token.
+ *
+ * Cada autenticacion puede gastar dos peticiones —el flujo preferido y el
+ * respaldo—, asi que contar peticiones de token ya no mide lo mismo.
+ */
+const autenticaciones = (llamadas) =>
+  llamadas.filter(
+    (l) =>
+      l.url.includes('/oauth2/token') &&
+      new URLSearchParams(l.opciones.body).get('grant_type') === 'client_credentials'
+  ).length;
+
+/** Los POST al endpoint de token, con su grant_type ya extraido. */
+const tokens = (llamadas) =>
+  llamadas
+    .filter((l) => l.url.includes('/oauth2/token'))
+    .map((l) => ({ ...l, grant: new URLSearchParams(l.opciones.body).get('grant_type') }));
 
 // --- contrato del puerto ---------------------------------------------------
 
@@ -79,15 +115,94 @@ test('createPorts lo acepta', () => {
 
 // --- autenticacion ---------------------------------------------------------
 
-test('autentica con password + security token concatenados', async () => {
+test('el respaldo de contrasena concatena password + security token', async () => {
   const { adaptador, llamadas } = construir();
   await adaptador.findLeadByEmailOrPhone({ email: 'a@b.com' });
 
-  const auth = llamadas[0];
-  assert.equal(auth.url, SECRETO.SF_URL);
-  const cuerpo = new URLSearchParams(auth.opciones.body);
-  assert.equal(cuerpo.get('grant_type'), 'password');
+  const intentos = tokens(llamadas);
+  assert.deepEqual(
+    intentos.map((t) => t.grant),
+    ['client_credentials', 'password'],
+    'primero el flujo preferido, luego el respaldo'
+  );
+
+  const cuerpo = new URLSearchParams(intentos[1].opciones.body);
+  assert.equal(intentos[1].url, SECRETO.SF_URL);
   assert.equal(cuerpo.get('password'), 'passtok', 'password + security token');
+  assert.equal(cuerpo.get('username'), 'user-prod');
+});
+
+test('con Client Credentials NO se intenta el flujo de contrasena', async () => {
+  const { adaptador, llamadas } = construir({ clientCredentials: true });
+  await adaptador.findLeadByEmailOrPhone({ email: 'a@b.com' });
+
+  const intentos = tokens(llamadas);
+  assert.deepEqual(intentos.map((t) => t.grant), ['client_credentials']);
+
+  // Client Credentials no manda identidad de usuario: es su razon de ser.
+  const cuerpo = new URLSearchParams(intentos[0].opciones.body);
+  assert.equal(cuerpo.get('username'), null, 'no debe viajar el usuario');
+  assert.equal(cuerpo.get('password'), null, 'no debe viajar la contrasena');
+  assert.equal(cuerpo.get('client_id'), 'cid-prod');
+  assert.equal(cuerpo.get('client_secret'), 'csec-prod');
+});
+
+test('si los dos flujos fallan, el error trae LOS DOS motivos', async () => {
+  // El `invalid_grant: authentication failure` de Salesforce es identico para
+  // contrasena mala, token caducado, flujo deshabilitado y politica de la app.
+  // Reportar los dos intentos es lo que permite distinguir "hay que activar el
+  // flujo en la org" de "la credencial esta mal".
+  const { adaptador } = construir({
+    respuestas: (url, o) => {
+      if (!url.includes('/oauth2/token')) return null;
+      const grant = new URLSearchParams(o.body).get('grant_type');
+      return grant === 'client_credentials'
+        ? texto(400, { error: 'invalid_grant', error_description: 'flow not enabled' })
+        : texto(400, { error: 'invalid_grant', error_description: 'authentication failure' });
+    },
+  });
+
+  await assert.rejects(adaptador.getLead(LEAD_ID), (e) => {
+    assert.equal(e.name, 'ProviderError');
+    assert.match(e.message, /client_credentials -> .*flow not enabled/);
+    assert.match(e.message, /password -> .*authentication failure/);
+    return true;
+  });
+});
+
+test('sin usuario ni token, Client Credentials basta', async () => {
+  // Una org que solo tenga el flujo moderno no deberia necesitar guardar
+  // contrasena ni security token en el secreto.
+  const llamadas = [];
+  const adaptador = createSalesforceLeadAdapter({
+    getSalesforceSecrets: async () => ({
+      SF_URL: SECRETO.SF_URL,
+      SF_CLIENT_ID: 'cid-prod',
+      SF_CLIENT_SECRET: 'csec-prod',
+    }),
+    fetchImpl: async (url, opciones) => {
+      llamadas.push({ url, opciones });
+      if (url.includes('/oauth2/token')) {
+        return texto(200, { access_token: 'tok-abc', instance_url: INSTANCIA });
+      }
+      return texto(200, { records: [] });
+    },
+  });
+
+  assert.equal(await adaptador.findLeadByEmailOrPhone({ email: 'a@b.com' }), null);
+  assert.deepEqual(tokens(llamadas).map((t) => t.grant), ['client_credentials']);
+});
+
+test('sin Client Credentials y sin credenciales de usuario, dice que faltan', async () => {
+  const adaptador = createSalesforceLeadAdapter({
+    getSalesforceSecrets: async () => ({
+      SF_URL: SECRETO.SF_URL,
+      SF_CLIENT_ID: 'cid-prod',
+      SF_CLIENT_SECRET: 'csec-prod',
+    }),
+    fetchImpl: async () => texto(400, { error: 'invalid_grant', error_description: 'nope' }),
+  });
+  await assert.rejects(adaptador.getLead(LEAD_ID), /le faltan claves: SF_USERNAME/);
 });
 
 test('el token se cachea entre llamadas', async () => {
@@ -95,8 +210,7 @@ test('el token se cachea entre llamadas', async () => {
   await adaptador.findLeadByEmailOrPhone({ email: 'a@b.com' });
   await adaptador.findLeadByEmailOrPhone({ email: 'c@d.com' });
 
-  const auths = llamadas.filter((l) => l.url.includes('/oauth2/token'));
-  assert.equal(auths.length, 1, 'no debe reautenticar en cada peticion');
+  assert.equal(autenticaciones(llamadas), 1, 'no debe reautenticar en cada peticion');
 });
 
 test('el token se renueva cuando caduca', async () => {
@@ -106,17 +220,17 @@ test('el token se renueva cuando caduca', async () => {
   reloj += 61 * 60 * 1000; // mas de una hora
   await adaptador.findLeadByEmailOrPhone({ email: 'c@d.com' });
 
-  assert.equal(llamadas.filter((l) => l.url.includes('/oauth2/token')).length, 2);
+  assert.equal(autenticaciones(llamadas), 2);
 });
 
 test('un 401 con token cacheado reautentica y reintenta UNA vez', async () => {
-  let queries = 0;
+  let consultas = 0;
   const { adaptador, llamadas } = construir({
     respuestas: (url) => {
       if (url.includes('/query')) {
-        queries += 1;
+        consultas += 1;
         // El primer query falla como si el token hubiera caducado antes de hora.
-        if (queries === 1) return texto(401, [{ errorCode: 'INVALID_SESSION_ID' }]);
+        if (consultas === 1) return texto(401, [{ errorCode: 'INVALID_SESSION_ID' }]);
       }
       return null;
     },
@@ -124,8 +238,8 @@ test('un 401 con token cacheado reautentica y reintenta UNA vez', async () => {
 
   const r = await adaptador.findLeadByEmailOrPhone({ email: 'a@b.com' });
   assert.equal(r, null);
-  assert.equal(llamadas.filter((l) => l.url.includes('/oauth2/token')).length, 2);
-  assert.equal(queries, 2, 'reintenta una vez');
+  assert.equal(autenticaciones(llamadas), 2);
+  assert.equal(consultas, 2, 'reintenta una vez');
 });
 
 test('un sandbox caducado devuelve HTML y se reporta como tal', async () => {
@@ -162,7 +276,7 @@ test('findLeadByEmailOrPhone escapa el SOQL en vez de concatenarlo', async () =>
   const { adaptador, llamadas } = construir();
   await adaptador.findLeadByEmailOrPhone({ email: "ana' OR Id != null OR '" });
 
-  const query = decodeURIComponent(llamadas[1].url.split('q=')[1]);
+  const query = decodeURIComponent(queries(llamadas)[0].url.split('q=')[1]);
   assert.ok(!/OR Id != null OR/.test(query.replace(/\\'/g, '')), 'inyeccion SOQL');
   assert.match(query, /\\'/, 'la comilla debe ir escapada');
 });
