@@ -83,6 +83,24 @@ app.use(helmet());
 // sigue con la politica global, intacta.
 app.use('/prequalify', require('./routes/prequalifyMount').buildCors());
 
+// El preflight de `/prequalify` TERMINA aqui, permitido o no.
+//
+// Cuando el CORS de arriba autoriza el origen, ya escribio sus cabeceras y
+// cerro el 204. Asi que si un OPTIONS llega hasta este middleware es porque el
+// origen NO esta en la lista blanca — y sin este corte seguiria hasta el CORS
+// global, que contesta `Access-Control-Allow-Origin: *`.
+//
+// Por que importa: el navegador no impide que la peticion se EJECUTE, solo que
+// se LEA la respuesta. Con un preflight permisivo, un sitio cualquiera podria
+// disparar a ciegas un POST que crea un lead o manda un OTP a un tercero, sin
+// ver nunca el resultado. Cortando aqui, el preflight falla y la peticion no
+// llega a salir.
+app.use('/prequalify', (req, res, next) => {
+  if (req.method !== 'OPTIONS') return next();
+  // Sin cabeceras de CORS: el navegador lo interpreta como no permitido.
+  return res.status(204).end();
+});
+
 app.use(cors({
   origin: process.env.CORS_ORIGIN || '*',
   // TODO(seguridad): `origin: '*'` junto a `credentials: true` es una
