@@ -10,7 +10,7 @@ const { createOtpService } = require('../lib/prequalify/otp');
 const { createInMemoryOtpStore } = require('../lib/prequalify/otpStore');
 const { createSessionManager } = require('../lib/prequalify/session');
 const { createPrequalifyRouter } = require('../routes/prequalify');
-const sm = require('../lib/prequalify/stateMachine');
+const mapper = require('../lib/prequalify/salesforceMapper');
 
 const SESSION_SECRET = 'secreto-de-sesion-de-precualificacion-largo';
 const OTP_SECRET = 'secreto-del-otp-suficientemente-largo-tambien';
@@ -40,56 +40,37 @@ const OTP_SECRET = 'secreto-del-otp-suficientemente-largo-tambien';
  * PUEDE hacer algo, el doble tampoco debe poder.
  */
 function fakeSalesforceComoLaOrgReal() {
-  const registros = new Map(); // id -> { campos..., currentStep__c }
+  const registros = new Map(); // id -> registro con FORMA DE SALESFORCE
   let seq = 0;
-
-  /** Igual que `completedSetFromLegacy`: si va por el paso N, los previos estan hechos. */
-  function derivarCompletados(registro) {
-    const paso = sm.fromLegacyStep(registro.currentStep__c);
-    if (!paso) return undefined; // sin numero no se sabe nada: lista AUSENTE
-    const hasta = sm.stepIndex(paso);
-    const contexto = {
-      typeOfCredit: registro.typeOfCredit,
-      mailingAddressDiffers: false,
-    };
-    return sm.STEP_ORDER.filter((s, i) => i < hasta && sm.appliesTo(s, contexto));
-  }
-
-  function vista(id) {
-    const r = registros.get(id);
-    if (!r) return null;
-    const { currentStep__c: legacy, ...datos } = r;
-    const paso = sm.fromLegacyStep(legacy);
-    return {
-      ...datos,
-      id,
-      currentStep: paso,
-      legacyStep: legacy,
-      completedSteps: derivarCompletados(r),
-    };
-  }
 
   return {
     registros,
     api: {
       findLeadByEmailOrPhone: async ({ email }) => {
-        for (const [id, r] of registros) if (r.email === email) return { id };
+        for (const [id, r] of registros) if (r.Email === email) return { id };
         return null;
       },
       createLead: async (lead) => {
         seq += 1;
         const id = `00Q${seq}`;
-        registros.set(id, { ...lead, currentStep__c: undefined });
+        registros.set(id, { Id: id, ...mapper.toLeadFields(lead) });
         return { id };
       },
-      getLead: async (id) => vista(id),
-      updateLead: async (id, campos) => {
+      // La LECTURA pasa por el mapper de produccion. Cualquier regresion en la
+      // derivacion de `completedSteps` rompe estos tests, que es el objetivo:
+      // una version propia aqui volveria a esconder los fallos.
+      getLead: async (id) => mapper.fromLeadRecord(registros.get(id) ?? null),
+      updateLead: async (id, campos, { step } = {}) => {
         const r = registros.get(id);
         if (!r) return;
-        // AQUI esta la fidelidad: `completedSteps` se descarta, porque en la
-        // org no hay donde escribirlo. Guardarlo seria mentir.
-        const { completedSteps, ...resto } = campos;
-        Object.assign(r, resto);
+        // `completedSteps` se DESCARTA, igual que en el adaptador real: la org
+        // no tiene campo donde escribirlo. Guardarlo seria mentir, y es
+        // exactamente la mentira que dejo pasar tres fallos.
+        const { completedSteps, ...resto } = campos ?? {};
+        void completedSteps;
+        // Misma traduccion que produccion, incluida la anidacion de la
+        // direccion: se importa, no se copia.
+        Object.assign(r, mapper.toLeadFields(mapper.toApiModelForStep(step, resto)));
       },
       setCurrentStep: async (id, legacy) => {
         const r = registros.get(id);
@@ -264,4 +245,61 @@ test('reanudar en otra sesion lleva al paso correcto, no al primero', async () =
 
   const estado = await call(app, 'GET', '/prequalify/leads', { token: v.body.token });
   assert.equal(estado.body.currentStep, 'personal');
+});
+
+test('completar la direccion NO devuelve al formulario vacio', async () => {
+  // Regresion del sintoma: "despues de ingresar la direccion y aceptar
+  // devuelve y borra la direccion / Faltaba completar un paso anterior".
+  //
+  // Causa: al completar `currentAddress` el siguiente paso es `creditCheck`,
+  // que NO tiene numero legacy, asi que `currentStep__c` se quedaba en 2 y la
+  // direccion no constaba como hecha. `credit-check` respondia 409 y el cliente
+  // retrocedia.
+  const { app, entregas } = buildApp();
+  const s = await arrancarComoElCliente(app, entregas);
+
+  await call(app, 'PATCH', `/prequalify/leads/${s.leadId}/personal`, {
+    token: s.token,
+    body: {
+      dob: IDENTIDAD.dob,
+      ssn: '123456789',
+      citizenship: 'U.S. Citizen',
+      maritalStatus: 'Single',
+      dependents: 0,
+      typeOfCredit: 'IndividualCredit',
+    },
+  });
+
+  const direccion = await call(app, 'PUT', `/prequalify/leads/${s.leadId}/addresses`, {
+    token: s.token,
+    body: {
+      line1: 'Calle Prueba 1',
+      city: 'San Juan',
+      state: 'PR',
+      zipCode: '00901',
+      housing: 'Own',
+      years: 5,
+      months: 0,
+      mailingAddressDiffers: false,
+    },
+  });
+  assert.equal(direccion.status, 200, JSON.stringify(direccion.body));
+  assert.equal(direccion.body.nextStep, 'creditCheck');
+
+  // Lo que fallaba: releer decia que tocaba la direccion OTRA VEZ.
+  const estado = await call(app, 'GET', '/prequalify/leads', { token: s.token });
+  assert.notEqual(
+    estado.body.currentStep,
+    'currentAddress',
+    'pedia la direccion de nuevo, borrando lo escrito'
+  );
+  assert.equal(estado.body.currentStep, 'creditCheck');
+
+  // Y el paso anunciado tiene que poder entrarse de verdad: un 409 aqui es el
+  // "Faltaba completar un paso anterior" que veia el usuario.
+  const credito = await call(app, 'POST', `/prequalify/leads/${s.leadId}/credit-check`, {
+    token: s.token,
+    body: { ssn: '123456789' },
+  });
+  assert.notEqual(credito.status, 409, JSON.stringify(credito.body));
 });

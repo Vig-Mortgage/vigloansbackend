@@ -621,7 +621,14 @@ test('fromLeadRecord devuelve el modelo camelCase de la API', () => {
     legacyStep: 2,
     currentStep: 'currentAddress',
     // Derivado, no leido: Salesforce no tiene campo para la lista.
-    completedSteps: ['start', 'otpVerify', 'personal'],
+    //
+    // `currentAddress` entra aunque `currentStep__c` sea 2 (o sea, "reanuda EN
+    // currentAddress"), porque este registro trae la direccion completa
+    // escrita. Es la via de EVIDENCIA: si los datos del paso estan en el Lead,
+    // el paso se hizo. Sin ella, completar la direccion no se podia registrar
+    // —el paso siguiente, `creditCheck`, no tiene numero legacy— y el wizard
+    // retrocedia al formulario vacio.
+    completedSteps: ['start', 'otpVerify', 'personal', 'currentAddress'],
   });
 });
 
