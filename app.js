@@ -123,6 +123,17 @@ app.use(
       salesforce: require('./lib/prequalify/adapters/salesforceLead').createSalesforceLeadAdapter({
         getSalesforceSecrets: () => getSecret('Salesforce'),
       }),
+      // Documentos del solicitante (licencia, talonarios, planillas) en S3.
+      //
+      // Reutiliza el cliente de S3 y el bucket del resto del backend, pero NO
+      // su esquema de claves: aqui el dueno es el lead, no un usuario del app,
+      // y la clave se construye a partir del dueno. El legacy subia con el
+      // nombre que mandaba el cliente (`upload_and_analyze.php:46`), que es el
+      // IDOR de la auditoria.
+      document: require('./lib/prequalify/adapters/documentStorage').createDocumentStorageAdapter({
+        getS3Client: () => s3Client,
+        getBackendSecrets,
+      }),
     },
   })
 );

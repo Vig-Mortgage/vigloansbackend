@@ -18,6 +18,7 @@
  */
 
 const express = require('express');
+const multer = require('multer');
 const rateLimit = require('express-rate-limit');
 const { z } = require('zod');
 
@@ -39,6 +40,12 @@ const schemas = require('../lib/prequalify/schemas');
 // solo lo invoca y guarda los dos numeros que sobreviven al reporte.
 const { parseCreditReport, toDecisionInput } = require('../lib/prequalify/experian');
 const { monthlyIncomeFrom } = require('../lib/prequalify/income');
+const {
+  DOCUMENT_KINDS,
+  MAX_FILE_BYTES,
+  MAX_DOCUMENTS_PER_LEAD,
+  parseDocumentKey,
+} = require('../lib/prequalify/documents');
 
 /** Mensaje unico para todo fallo de verificacion de OTP (anti-enumeracion). */
 const OTP_FALLO = 'El codigo no es valido o expiro. Solicita uno nuevo.';
@@ -431,6 +438,151 @@ function createPrequalifyRouter({ ports, otpService, sessions } = {}) {
     authorizeLead,
     requireStep(Step.SUBMIT),
     asyncHandler((req, res) => applyStep(req, res, Step.SUBMIT, {}))
+  );
+
+  // ---------------------------------------------------------------------
+  // Documentos
+  // ---------------------------------------------------------------------
+
+  /**
+   * Los documentos NO son un paso del wizard.
+   *
+   * En el legacy la subida estaba enganchada al final del flujo
+   * (`upload_and_analyze.php`), pero es una operacion transversal: se puede
+   * subir un talonario antes o despues de cualquier paso, y volver a subirlo.
+   * Por eso estas rutas exigen sesion y dueno, pero NO `requireStep`: meterlas
+   * en la maquina de estados obligaria a inventar un orden que el negocio no
+   * tiene.
+   */
+
+  /**
+   * El archivo se recibe EN MEMORIA, no directo a S3.
+   *
+   * `app.js` usa `multer-s3`, que sube mientras recibe. Aqui no sirve: hay que
+   * mirar los primeros bytes para comprobar que el archivo es de verdad lo que
+   * dice ser (`sniffContentType`), y con `multer-s3` el objeto ya esta escrito
+   * cuando se descubre que no lo era. Con 10 MB de tope y talonarios sueltos,
+   * tenerlo en memoria un instante es asumible.
+   */
+  const recibirArchivo = multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: MAX_FILE_BYTES, files: 1 },
+  }).single('file');
+
+  /**
+   * Envuelve a multer para que su error no llegue como 500.
+   *
+   * Multer lanza `LIMIT_FILE_SIZE` cuando el archivo pasa del tope. Sin esta
+   * traduccion, subir un PDF de 20 MB devolveria "error interno" y quien lo
+   * sube no sabria que le pasa.
+   */
+  function conArchivo(req, res, next) {
+    recibirArchivo(req, res, (err) => {
+      if (!err) return next();
+      if (err.code === 'LIMIT_FILE_SIZE') {
+        return res.status(413).json({
+          error: `El archivo supera el maximo de ${Math.floor(MAX_FILE_BYTES / (1024 * 1024))} MB.`,
+        });
+      }
+      if (err.code === 'LIMIT_UNEXPECTED_FILE') {
+        return res.status(400).json({ error: 'Envia un solo archivo en el campo "file".' });
+      }
+      return next(err);
+    });
+  }
+
+  const DocumentKindBody = z.object({
+    kind: z.enum(DOCUMENT_KINDS, {
+      required_error: 'Indica el tipo de documento',
+      invalid_type_error: 'Tipo de documento no valido',
+    }),
+  });
+
+  /** Sube un documento. El nombre del archivo del cliente NUNCA decide la ruta. */
+  router.post(
+    '/leads/:id/documents',
+    requireSession,
+    validate(LeadIdParams, 'params'),
+    authorizeLead,
+    conArchivo,
+    // La validacion del cuerpo va DESPUES de multer: en una peticion multipart
+    // los campos de texto no existen hasta que multer ha parseado el cuerpo.
+    validate(DocumentKindBody),
+    asyncHandler(async (req, res) => {
+      if (!req.file) {
+        return res.status(400).json({ error: 'Adjunta un archivo en el campo "file".' });
+      }
+
+      const { key } = await ports.document.upload({
+        leadId: req.prequal.leadId,
+        kind: req.validated.body.kind,
+        fileName: req.file.originalname,
+        contentType: req.file.mimetype,
+        bytes: req.file.buffer,
+      });
+
+      // Al cliente le vuelve el identificador, no la clave: la clave lleva
+      // dentro el id del lead y es lo que hay que teclear para intentar un
+      // IDOR. Con el `docId` no hay nada que adivinar — y aunque se adivinara,
+      // la ruta de descarga resuelve la clave desde el lead de la sesion.
+      const { docId } = parseDocumentKey(key) ?? {};
+      logger.info('prequalify.documento', { accion: 'subido', kind: req.validated.body.kind });
+      res.status(201).json({ docId, kind: req.validated.body.kind });
+    })
+  );
+
+  /** Lista los documentos del lead de la sesion. */
+  router.get(
+    '/leads/:id/documents',
+    requireSession,
+    validate(LeadIdParams, 'params'),
+    authorizeLead,
+    asyncHandler(async (req, res) => {
+      const documentos = await ports.document.listDocuments({ leadId: req.prequal.leadId });
+      res.json({
+        // Sin `key`: ver la nota de la subida.
+        documents: documentos.map((d) => ({ docId: d.docId, kind: d.kind })),
+        remaining: Math.max(0, MAX_DOCUMENTS_PER_LEAD - documentos.length),
+      });
+    })
+  );
+
+  const DocIdParams = z.object({
+    id: z.string(),
+    docId: z.string().regex(/^[a-f0-9]{16,64}$/, 'Documento no valido'),
+  });
+
+  /**
+   * Descarga un documento.
+   *
+   * **El cliente no manda la clave de S3, manda el `docId`**, y la clave se
+   * resuelve listando los documentos DEL LEAD DE LA SESION. Asi la clave nunca
+   * viene de fuera: aunque alguien conociera la clave de otro solicitante, no
+   * hay parametro por donde meterla. El adaptador vuelve a comprobar la
+   * pertenencia de todos modos — dos cierres para la misma puerta, que es lo
+   * que fallo en `/downloadFile`.
+   */
+  router.get(
+    '/leads/:id/documents/:docId',
+    requireSession,
+    validate(DocIdParams, 'params'),
+    authorizeLead,
+    asyncHandler(async (req, res) => {
+      const leadId = req.prequal.leadId;
+      const documentos = await ports.document.listDocuments({ leadId });
+      const encontrado = documentos.find((d) => d.docId === req.validated.params.docId);
+      if (!encontrado) return res.status(404).json({ error: 'Recurso no encontrado.' });
+
+      const doc = await ports.document.getDocument({ leadId, key: encontrado.key });
+      res.setHeader('Content-Type', doc.contentType || 'application/octet-stream');
+      if (doc.contentLength != null) res.setHeader('Content-Length', String(doc.contentLength));
+      // `attachment` y no `inline`: un HTML o un SVG que se colara pese a la
+      // lista blanca de tipos se ejecutaria en el origen del backend si el
+      // navegador lo abriera. Descargado, no.
+      res.setHeader('Content-Disposition', 'attachment');
+      res.setHeader('X-Content-Type-Options', 'nosniff');
+      doc.body.pipe(res);
+    })
   );
 
   return router;
