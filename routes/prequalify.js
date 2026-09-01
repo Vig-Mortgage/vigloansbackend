@@ -150,10 +150,32 @@ function createPrequalifyRouter({ ports, otpService, sessions } = {}) {
     next();
   }
 
+  /**
+   * Marca `otpVerify` como completado. Tener sesion ES la prueba.
+   *
+   * `completedSteps` no se persiste: se DERIVA de `currentStep__c`, que solo
+   * tiene numeros del 1 al 5 y ninguno corresponde a `start` ni a `otpVerify`
+   * (ver `completedSetFromLegacy` en el mapper). Asi que un lead recien creado
+   * vuelve con la lista vacia aunque el usuario acabe de teclear sus dos
+   * codigos, y la maquina de estados cree que no ha verificado nada.
+   *
+   * No se puede obtener una sesion sin verificar ambos codigos —es lo unico
+   * que emite token en `/otp/verify`—, asi que para cualquier peticion que
+   * llegue hasta aqui el paso esta hecho. Es un invariante, no una suposicion.
+   *
+   * El dia que exista un campo propio en Salesforce, esto sobra.
+   */
+  function conOtpVerificado(lead) {
+    if (!lead) return lead;
+    const hechos = new Set(lead.completedSteps ?? []);
+    hechos.add(Step.OTP_VERIFY);
+    return { ...lead, completedSteps: [...hechos] };
+  }
+
   /** Carga el lead y comprueba que el paso pedido es entrable. */
   function requireStep(step) {
     return asyncHandler(async (req, res, next) => {
-      const lead = await ports.salesforce.getLead(req.prequal.leadId);
+      const lead = conOtpVerificado(await ports.salesforce.getLead(req.prequal.leadId));
       if (!lead) return res.status(404).json({ error: 'Recurso no encontrado.' });
 
       if (!canEnter(step, lead)) {
@@ -319,7 +341,7 @@ function createPrequalifyRouter({ ports, otpService, sessions } = {}) {
     '/leads',
     requireSession,
     asyncHandler(async (req, res) => {
-      const lead = await ports.salesforce.getLead(req.prequal.leadId);
+      const lead = conOtpVerificado(await ports.salesforce.getLead(req.prequal.leadId));
       if (!lead) return res.status(404).json({ error: 'Recurso no encontrado.' });
 
       res.json({
