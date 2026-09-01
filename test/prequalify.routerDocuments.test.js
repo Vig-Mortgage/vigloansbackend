@@ -175,7 +175,14 @@ async function sesionCon(app, entregas, email, phone) {
   await call(app, 'POST', '/prequalify/otp', { body: { email, phone } });
   const ult = (canal) => [...entregas].reverse().find((e) => e.channel === canal)?.code;
   const v = await call(app, 'POST', '/prequalify/otp/verify', {
-    body: { email, phone, emailCode: ult('email'), phoneCode: ult('sms') },
+    body: {
+      email,
+      phone,
+      emailCode: ult('email'),
+      phoneCode: ult('sms'),
+      firstName: 'Juan',
+      lastName: 'Del Valle',
+    },
   });
   // El `leadId` sale de la verificacion del OTP, que es donde se crea o se
   // recupera el lead, no de `POST /leads` (ese completa el paso `start` y

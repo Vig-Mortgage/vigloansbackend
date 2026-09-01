@@ -139,6 +139,10 @@ async function autenticar(app, entregas, email = 'juan@example.com', phone = '78
       phone,
       emailCode: codigoDe(entregas, 'email'),
       phoneCode: codigoDe(entregas, 'sms'),
+      // El nombre viaja aqui porque es donde nace el lead y la org lo exige
+      // al insertar. Ver `otpVerifySchema`.
+      firstName: IDENTIDAD.firstName,
+      lastName: IDENTIDAD.lastName,
     },
   });
   return res.body;
@@ -203,7 +207,7 @@ test('el codigo correcto emite sesion; el malo da 401', async () => {
   await call(app, 'POST', '/prequalify/otp', { body: contacto });
 
   const malo = await call(app, 'POST', '/prequalify/otp/verify', {
-    body: { ...contacto, emailCode: '000000', phoneCode: '000000' },
+    body: { ...contacto, firstName: IDENTIDAD.firstName, lastName: IDENTIDAD.lastName, emailCode: '000000', phoneCode: '000000' },
   });
   assert.equal(malo.status, 401);
 
@@ -212,6 +216,8 @@ test('el codigo correcto emite sesion; el malo da 401', async () => {
       ...contacto,
       emailCode: codigoDe(entregas, 'email'),
       phoneCode: codigoDe(entregas, 'sms'),
+      firstName: IDENTIDAD.firstName,
+      lastName: IDENTIDAD.lastName,
     },
   });
   assert.equal(bueno.status, 200);
@@ -228,6 +234,8 @@ test('codigo malo y codigo inexistente dan la MISMA respuesta', async () => {
     body: {
       email: 'nadie@example.com', phone: '7870000000',
       emailCode: '123456', phoneCode: '123456',
+      firstName: IDENTIDAD.firstName,
+      lastName: IDENTIDAD.lastName,
     },
   });
 
@@ -238,6 +246,8 @@ test('codigo malo y codigo inexistente dan la MISMA respuesta', async () => {
     body: {
       email: 'juan@example.com', phone: '7871234567',
       emailCode: '000000', phoneCode: '000000',
+      firstName: IDENTIDAD.firstName,
+      lastName: IDENTIDAD.lastName,
     },
   });
 
@@ -677,14 +687,14 @@ test('un solo codigo correcto NO basta: hay que verificar correo y telefono', as
 
   // Correo bien, telefono mal.
   const soloCorreo = await call(app, 'POST', '/prequalify/otp/verify', {
-    body: { ...contacto, emailCode: codigoDe(entregas, 'email'), phoneCode: '000000' },
+    body: { ...contacto, firstName: IDENTIDAD.firstName, lastName: IDENTIDAD.lastName, emailCode: codigoDe(entregas, 'email'), phoneCode: '000000' },
   });
   assert.equal(soloCorreo.status, 401);
   assert.equal(soloCorreo.body.token, undefined);
 
   // Telefono bien, correo mal.
   const soloTelefono = await call(app, 'POST', '/prequalify/otp/verify', {
-    body: { ...contacto, emailCode: '000000', phoneCode: codigoDe(entregas, 'sms') },
+    body: { ...contacto, firstName: IDENTIDAD.firstName, lastName: IDENTIDAD.lastName, emailCode: '000000', phoneCode: codigoDe(entregas, 'sms') },
   });
   assert.equal(soloTelefono.status, 401);
   assert.equal(soloTelefono.body.token, undefined);
@@ -697,10 +707,10 @@ test('no se revela CUAL de los dos codigos fallo', async () => {
   await call(app, 'POST', '/prequalify/otp', { body: contacto });
 
   const a = await call(app, 'POST', '/prequalify/otp/verify', {
-    body: { ...contacto, emailCode: codigoDe(entregas, 'email'), phoneCode: '000000' },
+    body: { ...contacto, firstName: IDENTIDAD.firstName, lastName: IDENTIDAD.lastName, emailCode: codigoDe(entregas, 'email'), phoneCode: '000000' },
   });
   const b = await call(app, 'POST', '/prequalify/otp/verify', {
-    body: { ...contacto, emailCode: '000000', phoneCode: '111111' },
+    body: { ...contacto, firstName: IDENTIDAD.firstName, lastName: IDENTIDAD.lastName, emailCode: '000000', phoneCode: '111111' },
   });
   assert.deepEqual(a.body, b.body, 'la respuesta debe ser identica');
 });
@@ -721,6 +731,8 @@ test('el reto del telefono no depende de la via de entrega', async () => {
       ...contacto,
       emailCode: codigoDe(entregas, 'email'),
       phoneCode: codigoDe(entregas, 'whatsapp'),
+      firstName: IDENTIDAD.firstName,
+      lastName: IDENTIDAD.lastName,
     },
   });
   assert.equal(res.status, 200);

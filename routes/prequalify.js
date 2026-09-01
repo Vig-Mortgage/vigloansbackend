@@ -284,8 +284,18 @@ function createPrequalifyRouter({ ports, otpService, sessions } = {}) {
       }
 
       // Ambos verificados: se localiza o crea el lead y se emite la sesion.
+      //
+      // El nombre va en la creacion porque la org lo exige por regla de
+      // validacion ("Debe Ingresar el Nombre del Lead"). Crear el lead solo con
+      // email y telefono devolvia 400, y el usuario veia el mensaje generico de
+      // proveedor justo despues de teclear sus dos codigos. Ver `otpVerifySchema`.
+      //
+      // El resto de la identidad (fecha de nacimiento, proposito) sigue
+      // llegando en el paso `start`: la org no la exige al insertar.
+      const { firstName, lastName } = req.validated.body;
       const existente = await ports.salesforce.findLeadByEmailOrPhone({ email, phone });
-      const lead = existente ?? (await ports.salesforce.createLead({ email, phone }));
+      const lead =
+        existente ?? (await ports.salesforce.createLead({ email, phone, firstName, lastName }));
 
       const previos = (await ports.salesforce.getLead(lead.id))?.completedSteps ?? [];
       await ports.salesforce.updateLead(lead.id, {

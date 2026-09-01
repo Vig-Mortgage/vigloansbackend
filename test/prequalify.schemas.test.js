@@ -156,7 +156,14 @@ test('otpRequestSchema exige correo Y telefono: se verifican los dos', () => {
 });
 
 test('otpVerifySchema exige AMBOS codigos de 6 digitos', () => {
-  const base = { email: 'a@b.com', phone: '7871234567' };
+  // El nombre es parte del contrato desde 2026-09-01: es donde nace el lead y
+  // la org lo exige al insertar. Ver la nota del esquema.
+  const base = {
+    email: 'a@b.com',
+    phone: '7871234567',
+    firstName: 'Juan',
+    lastName: 'Del Valle',
+  };
   assert.equal(
     ok(otpVerifySchema, { ...base, emailCode: '123456', phoneCode: '654321' }).success,
     true
@@ -166,6 +173,24 @@ test('otpVerifySchema exige AMBOS codigos de 6 digitos', () => {
   falla(otpVerifySchema, { ...base, emailCode: '12345', phoneCode: '654321' });
   falla(otpVerifySchema, { ...base, emailCode: 'abcdef', phoneCode: '654321' });
   falla(otpVerifySchema, { emailCode: '123456', phoneCode: '654321' });      // sin destinatarios
+});
+
+test('otpVerifySchema exige el nombre: sin el, el lead no se puede crear', () => {
+  // Regresion de un fallo real: este endpoint creaba el lead con solo email y
+  // telefono, y la regla de validacion de la org ("Debe Ingresar el Nombre del
+  // Lead") devolvia 400. El usuario veia "No pudimos completar la operacion"
+  // justo despues de teclear sus dos codigos.
+  const codigos = { emailCode: '123456', phoneCode: '654321' };
+  const contacto = { email: 'a@b.com', phone: '7871234567' };
+  falla(otpVerifySchema, { ...contacto, ...codigos });                       // sin nombre ni apellido
+  falla(otpVerifySchema, { ...contacto, ...codigos, firstName: 'Juan' });    // falta el apellido
+  falla(otpVerifySchema, { ...contacto, ...codigos, lastName: 'Del Valle' }); // falta el nombre
+  falla(otpVerifySchema, { ...contacto, ...codigos, firstName: '', lastName: 'Del Valle' });
+  assert.equal(
+    ok(otpVerifySchema, { ...contacto, ...codigos, firstName: 'Juan', lastName: 'Del Valle' })
+      .success,
+    true
+  );
 });
 
 // --- personal -------------------------------------------------------------
