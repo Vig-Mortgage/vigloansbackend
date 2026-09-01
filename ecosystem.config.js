@@ -35,15 +35,19 @@ module.exports = {
     // arriba, un bucle de reinicios ya no amenaza a v1, asi que preferimos que
     // siga intentandolo.
 
-    env: {
-      PORT: 8081,
-      AWS_REGION: process.env.AWS_REGION || 'us-east-1',
-      // Secrets Manager
-      SM_AWS_ACCESS_KEY_ID: process.env.SM_AWS_ACCESS_KEY_ID,
-      SM_AWS_SECRET_ACCESS_KEY: process.env.SM_AWS_SECRET_ACCESS_KEY,
-      // S3
-      S3_AWS_ACCESS_KEY_ID: process.env.S3_AWS_ACCESS_KEY_ID,
-      S3_AWS_SECRET_ACCESS_KEY: process.env.S3_AWS_SECRET_ACCESS_KEY,
-    }
+    // NO hay bloque `env` aqui, y es deliberado.
+    //
+    // `app.js:17` hace `require('dotenv').config()`, asi que toda la
+    // configuracion sale del `.env` del servidor. Se comprobo en el proceso
+    // vivo: su entorno de arranque NO trae `PORT`, `AWS_REGION`,
+    // `SM_AWS_ACCESS_KEY_ID` ni `S3_AWS_ACCESS_KEY_ID` — nunca las inyecto pm2.
+    // El `.env` las tiene todas.
+    //
+    // El bloque que habia era una trampa: leia las claves de AWS de
+    // `process.env`, que en la sesion desde la que se reinicia estan vacias.
+    // Reiniciar con `pm2 restart ecosystem.config.js` las habria inyectado
+    // vacias por primera vez, y `dotenv` no sobreescribe una clave que ya
+    // existe — la autenticacion con AWS se habria roto de una forma dificil de
+    // diagnosticar, porque el archivo parecia estar pasandolas bien.
   }]
 }
