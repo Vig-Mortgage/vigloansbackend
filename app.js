@@ -66,8 +66,30 @@ async function getMailSecrets() {
 
 // -------------------- MIDDLEWARE DE SEGURIDAD --------------------
 app.use(helmet());
+
+// CORS de la precualificacion, ANTES del global y solo para `/prequalify`.
+//
+// El orden es el arreglo, no un detalle. `cors()` responde el preflight EL
+// MISMO —204 y fin— asi que el OPTIONS de `/prequalify` nunca llegaba a su
+// router y se contestaba con la politica global: `GET, POST, DELETE`. Sin
+// `PATCH` ni `PUT`, el navegador bloqueaba la peticion antes de enviarla y el
+// wizard fallaba con "No pudimos conectar" en datos personales, direcciones,
+// empleo e ingresos — TODO lo que no fuera POST. El app nativo no se enteraba
+// porque no hace preflight.
+//
+// Montado aqui, el preflight de `/prequalify` se contesta con su propia
+// politica: los metodos que de verdad usa y la lista blanca de origenes
+// (`PREQUALIFY_CORS_ORIGINS`), en vez del `*` del global. El resto de las rutas
+// sigue con la politica global, intacta.
+app.use('/prequalify', require('./routes/prequalifyMount').buildCors());
+
 app.use(cors({
   origin: process.env.CORS_ORIGIN || '*',
+  // TODO(seguridad): `origin: '*'` junto a `credentials: true` es una
+  // combinacion invalida —el navegador ignora el `*` cuando hay credenciales— y
+  // ademas peligrosa si algun dia se respeta. Afecta a TODO el backend, no solo
+  // a la precualificacion, y cambiarla puede romper a la app en produccion, asi
+  // que se deja anotada y no se toca en este arreglo.
   methods: ['GET', 'POST', 'DELETE'],
   credentials: true,
 }));

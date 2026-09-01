@@ -128,4 +128,4 @@ function createLazyPrequalifyMount({
   return mount;
 }
 
-module.exports = { createLazyPrequalifyMount, buildCors };
+module.exports = { buildCors, createLazyPrequalifyMount };
