@@ -52,11 +52,59 @@ test('ssn acepta con y sin guiones y normaliza a 9 digitos', () => {
 });
 
 test('ssn rechaza los rangos que la SSA nunca emite', () => {
-  falla(ssn, '000-45-6789'); // area 000
-  falla(ssn, '666-45-6789'); // area 666
-  falla(ssn, '900-45-6789'); // area 9xx
-  falla(ssn, '123-00-6789'); // grupo 00
-  falla(ssn, '123-45-0000'); // serie 0000
+  const antes = process.env.EXPERIAN_USE_UAT;
+  process.env.EXPERIAN_USE_UAT = 'false'; // produccion
+  try {
+    falla(ssn, '000-45-6789'); // area 000
+    falla(ssn, '666-45-6789'); // area 666
+    falla(ssn, '900-45-6789'); // area 9xx
+    falla(ssn, '123-00-6789'); // grupo 00
+    falla(ssn, '123-45-0000'); // serie 0000
+  } finally {
+    process.env.EXPERIAN_USE_UAT = antes;
+  }
+});
+
+test('ssn acepta el area 666 SOLO cuando Experian apunta a UAT', () => {
+  // El area 666 no la emite la SSA, y por eso Experian la usa para sus
+  // personas de prueba. Sin esta excepcion la consulta de credito no se podia
+  // ejercitar desde la interfaz: el formulario respondia "SSN invalido" antes
+  // de que la peticion saliera.
+  //
+  // La excepcion esta atada a la MISMA bandera que decide a que entorno de
+  // Experian se pide el reporte, asi que las dos no pueden divergir.
+  const antes = process.env.EXPERIAN_USE_UAT;
+  try {
+    process.env.EXPERIAN_USE_UAT = 'true';
+    assert.equal(ok(ssn, '666535944').success, true, 'en UAT debe aceptarse');
+    assert.equal(ok(ssn, '666069111').success, true);
+    assert.equal(ok(ssn, '666168048').success, true);
+
+    process.env.EXPERIAN_USE_UAT = 'false';
+    falla(ssn, '666535944'); // en produccion, NO
+
+    delete process.env.EXPERIAN_USE_UAT;
+    falla(ssn, '666535944'); // sin bandera tampoco: el defecto es el estricto
+  } finally {
+    if (antes === undefined) delete process.env.EXPERIAN_USE_UAT;
+    else process.env.EXPERIAN_USE_UAT = antes;
+  }
+});
+
+test('la excepcion de UAT NO se extiende a otros rangos basura', () => {
+  const antes = process.env.EXPERIAN_USE_UAT;
+  process.env.EXPERIAN_USE_UAT = 'true';
+  try {
+    // Solo 666 es rango de prueba de Experian. Los demas siguen prohibidos
+    // incluso en UAT: no son de nadie, son basura.
+    falla(ssn, '000-45-6789');
+    falla(ssn, '900-45-6789');
+    falla(ssn, '123-00-6789');
+    falla(ssn, '123-45-0000');
+  } finally {
+    if (antes === undefined) delete process.env.EXPERIAN_USE_UAT;
+    else process.env.EXPERIAN_USE_UAT = antes;
+  }
 });
 
 test('ssn rechaza formatos malos', () => {
